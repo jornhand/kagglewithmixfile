@@ -121,9 +121,14 @@ def _find_and_kill_targeted_processes(signal_to_send=signal.SIGTERM):
     return killed_pids_info
 
 def _shutdown_notebook_kernel_immediately():
-    log_system_event("critical", "准备立即通过 os._exit(0) 关闭当前 Kaggle Notebook Kernel 会话...")
-    sys.stdout.flush(); sys.stderr.flush(); time.sleep(0.1)
-    os._exit(0)
+    log_system_event("critical", "准备通过 SIGKILL 信号强制关闭当前 Kaggle Notebook Kernel...")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    time.sleep(0.5) # 留出一点时间让日志刷新
+    
+    # --- 核心修改：使用 os.kill 和 SIGKILL 替代 os._exit ---
+    # SIGKILL (信号 9) 是一个无法被捕获或忽略的信号，比 os._exit 更为强制。
+    os.kill(os.getpid(), signal.SIGKILL)
 
 # --- 第 2 步: MixFileCLI Python 客户端 (无变化) ---
 class MixFileCLIClient:
@@ -226,20 +231,26 @@ def handle_force_shutdown_notebook():
         log_system_event("error", "API Auth 失败: Token 无效。")
         return jsonify({"status": "error", "message": "Unauthorized"}), 401
     
-    log_system_event("info", "API Auth 成功。")
-    killed_processes_details = _find_and_kill_targeted_processes()
-    
-    def delayed_exit():
-        log_system_event("info", "延迟 Kernel 退出线程已启动。将在1秒后执行 os._exit(0)。")
-        time.sleep(1)
+    log_system_event("info", "API Auth 成功。正在安排后台关闭任务...")
+
+    # --- 核心修改在这里 ---
+    def delayed_full_shutdown():
+        # Step 1: 先杀死子进程 (frpc, java等)
+        log_system_event("info", "后台关闭任务：开始终止子进程...")
+        killed_processes_details = _find_and_kill_targeted_processes()
+        log_system_event("info", f"后台关闭任务：子进程终止尝试完成。详情: {killed_processes_details}")
+        
+        # Step 2: 稍作等待，然后终止主内核
+        time.sleep(2) # 增加延迟以确保日志能被记录
         _shutdown_notebook_kernel_immediately()
     
-    threading.Thread(target=delayed_exit, daemon=True).start()
+    # 立即启动后台线程，然后立刻返回响应
+    threading.Thread(target=delayed_full_shutdown, daemon=True).start()
     
+    # --- 核心修改：立即返回成功信息，不再等待进程被杀死 ---
     return jsonify({
         "status": "success",
-        "message": "关闭 Notebook Kernel 信号已接收。Kernel 将很快退出。",
-        "attempted_to_kill_processes": killed_processes_details
+        "message": "关闭信号已接收并成功响应。后台正在执行清理和内核关闭操作。",
     }), 200
 
 @app.route('/killer_status_frp', methods=['GET'])
