@@ -256,7 +256,7 @@ def handle_force_shutdown_notebook():
 @app.route('/killer_status_frp', methods=['GET'])
 def handle_health_status():
     return jsonify({
-        "status": "all_services_running",
+        "status": "killer_api_is_running_via_frp",
         "message": f"统一 API 服务正在运行，并通过 FRP 暴露。",
         "internal_listen_address": f"http://0.0.0.0:{FLASK_API_LOCAL_PORT}"
     }), 200
