@@ -293,12 +293,35 @@ def main():
         time.sleep(5)
         print("✅ Flask API 服务已在后台启动。")
 
-        print("\n>>> 正在启动 frpc 客户端...")
-        if not os.path.exists("/kaggle/input/net-tools-new/frpc"):
-            raise FileNotFoundError("❌ 错误: 未在 /kaggle/input/net-tools-new/ 目录下找到 frpc 文件。")
-            
-        run_command("cp /kaggle/input/net-tools-new/frpc /kaggle/working && chmod +x /kaggle/working/frpc").wait()
+        print("\n>>> 正在准备 frpc 客户端...")
         
+        # ############################################################### #
+        # ######## 新增：自动下载并准备 frpc #########
+        # ############################################################### #
+        FRP_VERSION = "0.54.0"  # 使用一个稳定的版本
+        FRP_ARCHIVE = f"frp_{FRP_VERSION}_linux_amd64.tar.gz"
+        FRP_URL = f"https://github.com/fatedier/frp/releases/download/v{FRP_VERSION}/{FRP_ARCHIVE}"
+        FRP_EXTRACTED_DIR = f"frp_{FRP_VERSION}_linux_amd64"
+        
+        if not os.path.exists("/kaggle/working/frpc"):
+            print(f"正在从官方源下载 frpc (版本: {FRP_VERSION})...")
+            run_command(f"wget -q --show-progress {FRP_URL}").wait()
+
+            print("正在解压 frpc...")
+            run_command(f"tar -zxvf {FRP_ARCHIVE}").wait()
+
+            print("正在设置 frpc...")
+            # frpc 二进制文件在解压后的目录中
+            run_command(f"mv ./{FRP_EXTRACTED_DIR}/frpc /kaggle/working/frpc").wait()
+            run_command("chmod +x /kaggle/working/frpc").wait()
+            print("✅ frpc 已准备就绪。")
+        else:
+            print("frpc 已存在，跳过下载。")
+        # ############################################################### #
+        # ######## 自动下载逻辑结束 #########
+        # ############################################################### #
+
+        print("\n>>> 正在启动 frpc 客户端...")
         frpc_ini_content = f"""
 [common]
 server_addr = {FRP_SERVER_ADDR}
