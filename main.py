@@ -43,7 +43,7 @@ history: "history.mix_list"
 # -- B. 加密的 FRP 服务配置 --
 # !!! 重要 !!!
 # 在这里粘贴你从 encrypt_util.py 工具中获得的加密配置字符串
-ENCRYPTED_FRP_CONFIG = "gAAAAABm... (请将这里替换成你自己的加密字符串)"
+ENCRYPTED_FRP_CONFIG = "gAAAAABotRuazfRzs7u7vMMCC5JblSb-ViSRTo0bRqRNINrHqMby9q2Um-8FLQiolwJUhZ3RMfNOFGzcyv45bbXmg3OyPZftGRMHMyDLkfsbc5A0ise_fEgbFx2IhEXOEDvfqzASuwqQy05UYHRn3QJE4i9Zrahv0-Z7KEMLBO02N81pAqzPU_w2wESz5E1vQh5kmiseU_t2"
 
 # -- C. 本地服务配置 --
 MIXFILE_LOCAL_PORT = 4719
