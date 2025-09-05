@@ -955,8 +955,8 @@ def main():
         # =====================================================================
         log_system_event("info", "服务正在启动：[1/7] 正在安装或验证依赖...")
         # 强制 pydantic 版本与独立脚本一致，排除潜在的版本冲突问题
-        run_command("pip install -q 'pydantic>=2.0' pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai requests").wait()
-        
+        run_command("pip install -q 'pydantic>=2.0' google-generativeai pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser requests").wait()
+
         if not shutil.which("ffmpeg") or not shutil.which("java"):
             raise RuntimeError("'ffmpeg' 或 'java' 未找到。这是必需的命令行工具。")
         log_system_event("info", "✅ 核心命令行工具已找到。")
