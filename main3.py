@@ -1119,11 +1119,12 @@ def preload_models():
         #new
         # --- 步骤 2: 等待几秒，让系统资源平稳 ---
         log_system_event("info", "  -> 等待 10 秒，准备加载模型到内存...")
-        time.sleep(10)
+        
         
         # --- 步骤 3: 从本地文件加载模型到 GPU ---
         log_system_event("info", "  -> 正在从本地文件加载模型到 GPU...")
         # pretrained.dns64() 在检测到本地文件存在时，会跳过下载直接加载
+        time.sleep(50)
         model = pretrained.dns64().cuda() 
         
         denoiser_model_global = model
