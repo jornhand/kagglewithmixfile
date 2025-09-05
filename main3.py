@@ -1090,22 +1090,46 @@ def process_unified_task(task_id: str, params: dict):
 # =============================================================================
 # --- 第 8 步: 主程序与服务启动 ---
 # =============================================================================
-
 def preload_models():
     #
-    # 在服务启动时预加载所有需要的 AI 模型。
-    #在下面
+    # 在服务启动时预加载所有需要的 AI 模型，并采用分步加载策略以避免资源尖峰。
+    #
     global denoiser_model_global
     log_system_event("info", "🧠 开始预加载 AI 模型...")
     try:
         from denoiser import pretrained
-        log_system_event("info", "  -> 正在加载 AI 降噪模型 (denoiser)...")
-        time.sleep(20)
-        print("结束")
-        # 这行代码会自动处理下载和加载
-        model = pretrained.dns64().cuda()
+        from torch.hub import download_url_to_file
+
+        # --- 步骤 1: 仅下载模型文件 ---
+        model_url = "https://huggingface.co/mysqls/bin/resolve/main/dns64-a7761ff99a7d5bb6.th"
+        
+        # 确保缓存目录存在
+        cache_dir = Path(os.environ.get("TORCH_HOME", "/root/.cache/torch")) / "hub/checkpoints"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        model_filename = os.path.basename(model_url)
+        model_path = cache_dir / model_filename
+
+        if not model_path.exists():
+            log_system_event("info", f"  -> 模型文件不存在，正在下载到: {model_path}")
+            download_url_to_file(model_url, model_path, progress=True)
+            log_system_event("info", "  -> ✅ 模型文件下载完成。")
+        else:
+            log_system_event("info", f"  -> 模型文件已存在于缓存: {model_path}")
+        #new
+        # --- 步骤 2: 等待几秒，让系统资源平稳 ---
+        log_system_event("info", "  -> 等待 10 秒，准备加载模型到内存...")
+        time.sleep(10)
+        
+        # --- 步骤 3: 从本地文件加载模型到 GPU ---
+        log_system_event("info", "  -> 正在从本地文件加载模型到 GPU...")
+        # pretrained.dns64() 在检测到本地文件存在时，会跳过下载直接加载
+        model = pretrained.dns64().cuda() 
+        
         denoiser_model_global = model
+        
         log_system_event("info", "  -> ✅ AI 降噪模型已成功加载到 GPU。")
+        
     except Exception as e:
         log_system_event("warning", f"  -> ⚠️  预加载 AI 降噪模型失败: {e}")
         log_system_event("warning", "     字幕提取过程中的降噪步骤将被跳过。")
