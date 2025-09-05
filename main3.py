@@ -460,7 +460,7 @@ def preprocess_audio_for_subtitles(
         raise RuntimeError(f"FFmpeg 提取音频失败: {e.stderr}")
 
     # 2. 尝试加载 AI 降噪模型
-    denoiser_model = denoiser_model_global
+    denoiser_model = denoiser_model_global  
     # try:
     #     from denoiser import pretrained
     #     update_status_callback(stage="subtitle_denoise", details="正在加载 AI 降噪模型...")
@@ -1088,76 +1088,73 @@ def process_unified_task(task_id: str, params: dict):
 
 
 # =============================================================================
-# --- 第 8 步: 主程序与服务启动 ---
+# --- 第 8 步: 主程序与服务启动 (最终优化版) ---
 # =============================================================================
+
 def preload_models():
     #
-    # 在服务启动时预加载所有需要的 AI 模型，并采用分步加载策略以避免资源尖峰。
+    # 在服务启动时预加载所有需要的 AI 模型。
+    # 这个函数现在只负责加载模型，不处理下载，假设文件已存在。
     #
     global denoiser_model_global
-    log_system_event("info", "🧠 开始预加载 AI 模型...")
+    log_system_event("info", "🧠 正在从本地文件加载模型...")
     try:
         from denoiser import pretrained
-        from torch.hub import download_url_to_file
-
-        # --- 步骤 1: 仅下载模型文件 ---
-        model_url = "https://huggingface.co/mysqls/bin/resolve/main/dns64-a7761ff99a7d5bb6.th"
-        
-        # 确保缓存目录存在
-        cache_dir = Path(os.environ.get("TORCH_HOME", "/root/.cache/torch")) / "hub/checkpoints"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        model_filename = os.path.basename(model_url)
-        model_path = cache_dir / model_filename
-
-        if not model_path.exists():
-            log_system_event("info", f"  -> 模型文件不存在，正在下载到: {model_path}")
-            download_url_to_file(model_url, model_path, progress=True)
-            log_system_event("info", "  -> ✅ 模型文件下载完成。")
-        else:
-            log_system_event("info", f"  -> 模型文件已存在于缓存: {model_path}")
-        #new
-        # --- 步骤 2: 等待几秒，让系统资源平稳 ---
-        log_system_event("info", "  -> 等待 10 秒，准备加载模型到内存...")
-        time.sleep(10)
-        
-        # --- 步骤 3: 从本地文件加载模型到 GPU ---
-        log_system_event("info", "  -> 正在从本地文件加载模型到 GPU...")
-        # pretrained.dns64() 在检测到本地文件存在时，会跳过下载直接加载
-        model = pretrained.dns64().cuda() 
-        
+        model = pretrained.dns64().cuda()
         denoiser_model_global = model
-        
         log_system_event("info", "  -> ✅ AI 降噪模型已成功加载到 GPU。")
-        
     except Exception as e:
-        log_system_event("warning", f"  -> ⚠️  预加载 AI 降噪模型失败: {e}")
+        log_system_event("warning", f"  -> ⚠️  加载 AI 降噪模型失败: {e}")
         log_system_event("warning", "     字幕提取过程中的降噪步骤将被跳过。")
+
 
 def main():
     #
     # 主执行函数，负责初始化和启动所有服务。
+    # 采用“资源优先”策略：先完成最消耗资源的操作，再启动后台服务。
     #
     global api_client, subtitle_config_global, FRP_SERVER_ADDR, MIXFILE_REMOTE_PORT
-    # --- [!!! 新增的核心修复代码 !!!] ---
-    # 在所有 torch 相关操作之前，设置 PyTorch Hub 的缓存目录
-    # 将其指向我们有完全权限的 /kaggle/working/ 目录
+    
+    # --- 步骤 0: 设置缓存目录 ---
     torch_cache_dir = "/kaggle/working/torch_cache"
     os.environ['TORCH_HOME'] = torch_cache_dir
     log_system_event("info", f"已将 PyTorch Hub 缓存目录设置为: {torch_cache_dir}")
-    # --- [修改结束] ---
+    
     try:
-        # --- 1. 启动前准备 ---
-        log_system_event("info", "服务正在启动...")
-        run_command("pip install -q pydantic pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai requests").wait()
-        check_environment()
-
-        # --- [!!! 新增调用 !!!] ---
-        # 预加载 AI 模型
-        preload_models()
-        # --- [修改结束] ---
+        # --- 步骤 1: 安装依赖 ---
+        log_system_event("info", "服务正在启动：正在安装依赖...")
+        # 强制 pydantic 版本与独立脚本一致，排除潜在的版本冲突问题
+        run_command("pip install -q 'pydantic>=2.0' pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai flask cryptography").wait()
         
-        # --- 2. 解密配置 ---
+        # --- 步骤 2: 检查核心环境 (命令行工具) ---
+        # 此时不检查 Python 库，因为我们刚装完
+        if not shutil.which("ffmpeg") or not shutil.which("java"):
+            raise RuntimeError("'ffmpeg' 或 'java' 未找到。")
+        log_system_event("info", "✅ 核心命令行工具已找到。")
+
+        # --- 步骤 3: 【关键】在系统最干净时，手动下载并预加载模型 ---
+        from torch.hub import download_url_to_file
+        model_url = "https://dl.fbaipublicfiles.com/adiyoss/denoiser/dns64-a7761ff99a7d5bb6.th"
+        cache_dir = Path(torch_cache_dir) / "hub/checkpoints"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        model_path = cache_dir / os.path.basename(model_url)
+
+        if not model_path.exists():
+            log_system_event("info", f"🧠 模型文件不存在，正在下载到: {model_path}")
+            download_url_to_file(model_url, model_path, progress=True)
+            log_system_event("info", "  -> ✅ 模型文件下载完成。")
+        else:
+            log_system_event("info", f"🧠 模型文件已存在于缓存: {model_path}")
+
+        # 等待 I/O 操作完成，给系统喘息时间
+        log_system_event("info", "  -> 等待 5 秒...")
+        time.sleep(5)
+        
+        # 现在加载模型
+        preload_models()
+        
+        # --- 步骤 4: 解密配置 ---
+        log_system_event("info", "模型加载成功，开始初始化服务...")
         frp_config = get_decrypted_config(ENCRYPTED_FRP_CONFIG, "FRP")
         subtitle_config_global = get_decrypted_config(ENCRYPTED_SUBTITLE_CONFIG, "Subtitle")
         
@@ -1165,31 +1162,26 @@ def main():
         FRP_SERVER_PORT = frp_config['FRP_SERVER_PORT']
         FRP_TOKEN = frp_config['FRP_TOKEN']
         
-        # --- 3. 初始化 MixFile 客户端 ---
-        # 注意：这里使用 localhost，因为 Flask 和 MixFileCLI 都在 Kaggle 容器内运行
+        # --- 步骤 5: 初始化 MixFile 客户端 ---
         api_client_base_url = f"http://127.0.0.1:{MIXFILE_LOCAL_PORT}"
         api_client = MixFileCLIClient(base_url=api_client_base_url)
 
-        # --- 4. 启动 MixFileCLI 服务 ---
-        log_system_event("info", "正在创建 MixFileCLI config.yml...")
+        # --- 步骤 6: 现在才启动后台服务 ---
+        log_system_event("info", "正在启动 MixFileCLI (JVM)...")
         with open("config.yml", "w") as f: f.write(mixfile_config_yaml)
-        
-        log_system_event("info", "正在下载并启动 MixFileCLI...")
         if not os.path.exists("mixfile-cli.jar"):
-            run_command("wget -q --show-progress https://raw.githubusercontent.com/jornhand/kagglewithmixfile/refs/heads/main/mixfile-cli-2.0.1.jar -O mixfile-cli.jar").wait()
+            run_command("wget -q --show-progress https://github.com/HelloWorldWinning/mixfile-cli/releases/download/2.0.1/mixfile-cli-2.0.1.jar -O mixfile-cli.jar").wait()
         run_command("java -jar mixfile-cli.jar", "mixfile.log")
         if not wait_for_port(MIXFILE_LOCAL_PORT):
-            raise RuntimeError("MixFileCLI 服务启动失败，请检查 mixfile.log。")
+            raise RuntimeError("MixFileCLI 服务启动失败。")
 
-        # --- 5. 启动 Flask API 服务 ---
         def run_flask_app():
             app.run(host='0.0.0.0', port=FLASK_API_LOCAL_PORT, debug=False, use_reloader=False)
         log_system_event("info", "正在后台启动 Flask API 服务...")
         threading.Thread(target=run_flask_app, daemon=True).start()
-        time.sleep(3) # 等待 Flask 启动
+        time.sleep(3)
 
-        # --- 6. 启动 frpc 客户端 ---
-        log_system_event("info", "正在准备 frpc 客户端...")
+        log_system_event("info", "正在准备并启动 frpc 客户端...")
         if not os.path.exists("/kaggle/working/frpc"):
             run_command("wget -q https://github.com/fatedier/frp/releases/download/v0.54.0/frp_0.54.0_linux_amd64.tar.gz && tar -zxvf frp_0.54.0_linux_amd64.tar.gz && mv frp_0.54.0_linux_amd64/frpc /kaggle/working/frpc && chmod +x /kaggle/working/frpc").wait()
         
@@ -1215,7 +1207,7 @@ remote_port = {FLASK_API_REMOTE_PORT}
         log_system_event("info", "frpc 客户端已在后台启动。")
         time.sleep(3)
         
-        # --- 7. 最终状态报告与保活 ---
+        # --- 步骤 7: 最终状态报告与保活 ---
         public_api_base_url = f"http://{FRP_SERVER_ADDR}:{FLASK_API_REMOTE_PORT}"
         print("\n" + "="*60)
         print("🎉 所有服务均已成功启动！您的统一 API 已上线。")
@@ -1236,7 +1228,6 @@ remote_port = {FLASK_API_REMOTE_PORT}
         log_system_event("info", "服务已手动停止。")
     except Exception as e:
         log_system_event("critical", f"发生未知的致命错误: {e}")
-
 
 if __name__ == '__main__':
     main()
