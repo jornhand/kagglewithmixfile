@@ -1091,6 +1091,23 @@ def process_unified_task(task_id: str, params: dict):
 # --- 第 8 步: 主程序与服务启动 ---
 # =============================================================================
 
+def preload_models():
+    #
+    # 在服务启动时预加载所有需要的 AI 模型。
+    #
+    global denoiser_model_global
+    log_system_event("info", "🧠 开始预加载 AI 模型...")
+    try:
+        from denoiser import pretrained
+        log_system_event("info", "  -> 正在加载 AI 降噪模型 (denoiser)...")
+        # 这行代码会自动处理下载和加载
+        model = pretrained.dns64().cuda()
+        denoiser_model_global = model
+        log_system_event("info", "  -> ✅ AI 降噪模型已成功加载到 GPU。")
+    except Exception as e:
+        log_system_event("warning", f"  -> ⚠️  预加载 AI 降噪模型失败: {e}")
+        log_system_event("warning", "     字幕提取过程中的降噪步骤将被跳过。")
+
 def main():
     #
     # 主执行函数，负责初始化和启动所有服务。
@@ -1193,23 +1210,6 @@ remote_port = {FLASK_API_REMOTE_PORT}
         log_system_event("info", "服务已手动停止。")
     except Exception as e:
         log_system_event("critical", f"发生未知的致命错误: {e}")
-
-def preload_models():
-    #
-    # 在服务启动时预加载所有需要的 AI 模型。
-    #
-    global denoiser_model_global
-    log_system_event("info", "🧠 开始预加载 AI 模型...")
-    try:
-        from denoiser import pretrained
-        log_system_event("info", "  -> 正在加载 AI 降噪模型 (denoiser)...")
-        # 这行代码会自动处理下载和加载
-        model = pretrained.dns64().cuda()
-        denoiser_model_global = model
-        log_system_event("info", "  -> ✅ AI 降噪模型已成功加载到 GPU。")
-    except Exception as e:
-        log_system_event("warning", f"  -> ⚠️  预加载 AI 降噪模型失败: {e}")
-        log_system_event("warning", "     字幕提取过程中的降噪步骤将被跳过。")
 
 
 if __name__ == '__main__':
