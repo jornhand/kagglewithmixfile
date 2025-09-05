@@ -460,14 +460,14 @@ def preprocess_audio_for_subtitles(
         raise RuntimeError(f"FFmpeg 提取音频失败: {e.stderr}")
 
     # 2. 尝试加载 AI 降噪模型
-    denoiser_model = None
-    try:
-        from denoiser import pretrained
-        update_status_callback(stage="subtitle_denoise", details="正在加载 AI 降噪模型...")
-        denoiser_model = pretrained.dns64().cuda()
-        log_system_event("info", "AI 降噪模型加载成功。")
-    except Exception as e:
-        log_system_event("warning", f"加载 AI 降噪模型失败，将跳过降噪步骤。错误: {e}")
+    denoiser_model = denoiser_model_global
+    # try:
+    #     from denoiser import pretrained
+    #     update_status_callback(stage="subtitle_denoise", details="正在加载 AI 降噪模型...")
+    #     denoiser_model = pretrained.dns64().cuda()
+    #     log_system_event("info", "AI 降噪模型加载成功。")
+    # except Exception as e:
+    #     log_system_event("warning", f"加载 AI 降噪模型失败，将跳过降噪步骤。错误: {e}")
 
     # 3. 分块处理音频：降噪 -> VAD
     update_status_callback(stage="subtitle_vad", details="正在进行音频分块与语音检测...")
@@ -800,6 +800,7 @@ tasks_lock = threading.Lock()
 # 全局变量，将在 main 函数中被初始化
 api_client = None 
 subtitle_config_global = {}
+denoiser_model_global = None # <<< 新增：用于存储预加载的降噪模型
 
 
 # --- B. API 路由定义 ---
@@ -1095,13 +1096,24 @@ def main():
     # 主执行函数，负责初始化和启动所有服务。
     #
     global api_client, subtitle_config_global, FRP_SERVER_ADDR, MIXFILE_REMOTE_PORT
-    
+    # --- [!!! 新增的核心修复代码 !!!] ---
+    # 在所有 torch 相关操作之前，设置 PyTorch Hub 的缓存目录
+    # 将其指向我们有完全权限的 /kaggle/working/ 目录
+    torch_cache_dir = "/kaggle/working/torch_cache"
+    os.environ['TORCH_HOME'] = torch_cache_dir
+    log_system_event("info", f"已将 PyTorch Hub 缓存目录设置为: {torch_cache_dir}")
+    # --- [修改结束] ---
     try:
         # --- 1. 启动前准备 ---
         log_system_event("info", "服务正在启动...")
         run_command("pip install -q pydantic pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai requests").wait()
         check_environment()
 
+        # --- [!!! 新增调用 !!!] ---
+        # 预加载 AI 模型
+        preload_models()
+        # --- [修改结束] ---
+        
         # --- 2. 解密配置 ---
         frp_config = get_decrypted_config(ENCRYPTED_FRP_CONFIG, "FRP")
         subtitle_config_global = get_decrypted_config(ENCRYPTED_SUBTITLE_CONFIG, "Subtitle")
@@ -1181,6 +1193,24 @@ remote_port = {FLASK_API_REMOTE_PORT}
         log_system_event("info", "服务已手动停止。")
     except Exception as e:
         log_system_event("critical", f"发生未知的致命错误: {e}")
+
+def preload_models():
+    #
+    # 在服务启动时预加载所有需要的 AI 模型。
+    #
+    global denoiser_model_global
+    log_system_event("info", "🧠 开始预加载 AI 模型...")
+    try:
+        from denoiser import pretrained
+        log_system_event("info", "  -> 正在加载 AI 降噪模型 (denoiser)...")
+        # 这行代码会自动处理下载和加载
+        model = pretrained.dns64().cuda()
+        denoiser_model_global = model
+        log_system_event("info", "  -> ✅ AI 降噪模型已成功加载到 GPU。")
+    except Exception as e:
+        log_system_event("warning", f"  -> ⚠️  预加载 AI 降噪模型失败: {e}")
+        log_system_event("warning", "     字幕提取过程中的降噪步骤将被跳过。")
+
 
 if __name__ == '__main__':
     main()
