@@ -1121,7 +1121,7 @@ def main():
         
         log_system_event("info", "正在下载并启动 MixFileCLI...")
         if not os.path.exists("mixfile-cli.jar"):
-            run_command("wget -q --show-progress https://github.com/HelloWorldWinning/mixfile-cli/releases/download/2.0.1/mixfile-cli-2.0.1.jar -O mixfile-cli.jar").wait()
+            run_command("wget -q --show-progress https://raw.githubusercontent.com/jornhand/kagglewithmixfile/refs/heads/main/mixfile-cli-2.0.1.jar -O mixfile-cli.jar").wait()
         run_command("java -jar mixfile-cli.jar", "mixfile.log")
         if not wait_for_port(MIXFILE_LOCAL_PORT):
             raise RuntimeError("MixFileCLI 服务启动失败，请检查 mixfile.log。")
