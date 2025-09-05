@@ -1099,7 +1099,7 @@ def main():
     try:
         # --- 1. 启动前准备 ---
         log_system_event("info", "服务正在启动...")
-        run_command("pip install -q pydantic pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai").wait()
+        run_command("pip install -q pydantic pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai requests").wait()
         check_environment()
 
         # --- 2. 解密配置 ---
