@@ -1094,7 +1094,7 @@ def process_unified_task(task_id: str, params: dict):
 def preload_models():
     #
     # 在服务启动时预加载所有需要的 AI 模型。
-    #
+    #在下面
     global denoiser_model_global
     log_system_event("info", "🧠 开始预加载 AI 模型...")
     try:
