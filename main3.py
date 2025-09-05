@@ -1100,6 +1100,8 @@ def preload_models():
     try:
         from denoiser import pretrained
         log_system_event("info", "  -> 正在加载 AI 降噪模型 (denoiser)...")
+        time.sleep(20)
+        print("结束")
         # 这行代码会自动处理下载和加载
         model = pretrained.dns64().cuda()
         denoiser_model_global = model
