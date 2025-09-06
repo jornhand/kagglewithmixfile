@@ -449,7 +449,6 @@ def read_and_encode_file_base64(filepath: str) -> str | None:
         return None
 
 # --- C. 音频预处理管道 ---
-
 def preprocess_audio_for_subtitles(
     video_path: Path,
     temp_dir: Path,
@@ -467,8 +466,6 @@ def preprocess_audio_for_subtitles(
     from faster_whisper.vad import VadOptions, get_speech_timestamps
 
     # --- STAGE 0: 初始化模型 (不变) ---
-    # ... (此处省略与上一版完全相同的模型加载代码，以节省篇幅) ...
-    # ... (请确保您的代码中保留了这部分)
     update_status_callback(stage="subtitle_init_models", details="正在初始化高级音频处理模型...")
 
     try:
@@ -491,10 +488,7 @@ def preprocess_audio_for_subtitles(
         log_system_event("warning", f"加载 YAMNet 模型失败: {e}", in_worker=True)
         yamnet_model = None
 
-
-    # --- STAGE 1: 提取与粗分离 (Demucs) (不变) ---
-    # ... (此处省略与上一版完全相同的 Demucs 代码) ...
-    # ... (请确保您的代码中保留了这部分)
+    # --- STAGE 1: 提取与粗分离 (Demucs) ---
     update_status_callback(stage="subtitle_extract_audio", details="正在提取原始音频...")
     raw_audio_path = temp_dir / "raw_audio.wav"
     try:
@@ -508,9 +502,10 @@ def preprocess_audio_for_subtitles(
         demucs_model = pretrained.get_model('htdemucs_ft')
         demucs_model.cuda()
         log_system_event("info", "Demucs 模型加载成功，开始处理音频...", in_worker=True)
-        model_out = apply_model(demucs_model, [str(raw_audio_path)], device='cuda', split=True, jobs=0)
+        # 【修复 1】: 移除 'jobs' 参数
+        model_out = apply_model(demucs_model, [str(raw_audio_path)], device='cuda', split=True)
         if model_out: vocals_tensor = model_out[0]['vocals']
-        else: raise RuntimeError("Demucs aooly_model 未返回有效结果")
+        else: raise RuntimeError("Demucs apply_model 未返回有效结果")
         vocals_path = temp_dir / "demucs_output" / (raw_audio_path.stem + "_vocals.wav")
         vocals_path.parent.mkdir(parents=True, exist_ok=True)
         save_audio(vocals_tensor.cpu(), str(vocals_path), samplerate=demucs_model.samplerate)
@@ -521,46 +516,56 @@ def preprocess_audio_for_subtitles(
         log_system_event("warning", "将使用原始音频继续处理。", in_worker=True)
         processing_audio_path = raw_audio_path
         
-        
     # --- STAGE 2: 基于VAD的智能分块与语音增强 ---
     update_status_callback(stage="subtitle_smart_chunking", details="正在进行智能分块...")
-    
-    # 首先将音频统一到16kHz单声道
     mono_16k_audio_path = temp_dir / "mono_16k_audio.wav"
     ffmpeg_resample_cmd = [ "ffmpeg", "-i", str(processing_audio_path), "-ac", "1", "-ar", "16000", "-y", "-loglevel", "error", str(mono_16k_audio_path)]
     subprocess.run(ffmpeg_resample_cmd, check=True)
     
-    # 第一次VAD：用于分块
     log_system_event("info", "正在运行第一次VAD以进行智能分块...", in_worker=True)
     audio_data_for_chunking = decode_audio(str(mono_16k_audio_path), sampling_rate=16000)
-    # 使用较宽松的VAD参数来获取语音边界
     chunk_vad_options = VadOptions(min_silence_duration_ms=500)
     speech_segments = get_speech_timestamps(audio_data_for_chunking, vad_options=chunk_vad_options)
 
-    # 智能合并算法
-    max_chunk_duration_s = 300  # 每个大块最长 300 秒 (5分钟)
+    # 【修复 2】: 改进智能分块算法
+    max_chunk_duration_s = 240  # 稍微缩短最大时长为 4 分钟
+    long_silence_threshold_s = 1.5 # 长静音阈值，超过3秒就分块
     smart_chunks = []
-    current_chunk = []
-    current_duration = 0
+    current_chunk_segments = []
+    
+    if speech_segments:
+        last_seg_end_s = speech_segments[0]['start'] / 16000.0
+        
+        for seg in speech_segments:
+            current_seg_start_s = seg['start'] / 16000.0
+            
+            # 计算当前块的总时长（从块的第一个片段开始到这个片段结束）
+            chunk_duration = (seg['end'] - current_chunk_segments[0]['start']) / 16000.0 if current_chunk_segments else 0
+            
+            # 判断是否需要切分
+            is_long_silence = (current_seg_start_s - last_seg_end_s) > long_silence_threshold_s
+            is_duration_exceeded = chunk_duration > max_chunk_duration_s
 
-    for seg in speech_segments:
-        seg_duration = (seg['end'] - seg['start']) / 16000.0
-        if current_duration + seg_duration > max_chunk_duration_s and len(current_chunk) > 0:
-            smart_chunks.append(current_chunk)
-            current_chunk = []
-            current_duration = 0
-        current_chunk.append(seg)
-        current_duration += seg_duration
-    if len(current_chunk) > 0:
-        smart_chunks.append(current_chunk)
+            if (is_long_silence or is_duration_exceeded) and current_chunk_segments:
+                smart_chunks.append(current_chunk_segments)
+                current_chunk_segments = []
+
+            if not current_chunk_segments:
+                current_chunk_segments.append(seg)
+            else: # 在新版Faster-Whisper中，VAD时间戳可能重叠，需要合并
+                current_chunk_segments[-1]['end'] = max(current_chunk_segments[-1]['end'], seg['end'])
+            
+            last_seg_end_s = seg['end'] / 16000.0
+
+        if current_chunk_segments:
+            smart_chunks.append(current_chunk_segments)
 
     log_system_event("info", f"智能分块完成，共得到 {len(smart_chunks)} 个大块。", in_worker=True)
     
-    # 对每个大块进行增强，然后拼接回一个文件
     original_waveform, sr = torchaudio.load(str(mono_16k_audio_path))
-    enhanced_segments = []
+    enhanced_segments_waveforms = []
 
-    if speech_enhancer:
+    if speech_enhancer and smart_chunks:
         update_status_callback(stage="subtitle_speech_enhancement", details=f"正在增强 {len(smart_chunks)} 个大块...")
         for i, chunk_group in enumerate(smart_chunks):
             chunk_start_sample = chunk_group[0]['start']
@@ -572,27 +577,29 @@ def preprocess_audio_for_subtitles(
                     waveform_chunk.cuda().unsqueeze(0).contiguous(), 
                     lengths=torch.tensor([1.0]).cuda()
                 ).squeeze(0).cpu()
-                enhanced_segments.append(enhanced_chunk)
+                enhanced_segments_waveforms.append(enhanced_chunk)
                 log_system_event("info", f"大块 {i+1}/{len(smart_chunks)} 增强完成。", in_worker=True)
             except Exception as e:
                 log_system_event("warning", f"增强大块 {i+1} 失败: {e}，将使用原始音频片段。", in_worker=True)
-                enhanced_segments.append(waveform_chunk) # 失败则使用原始片段
-    else: # 如果模型未加载，直接使用原始分块
+                enhanced_segments_waveforms.append(waveform_chunk)
+    else:
         for chunk_group in smart_chunks:
             chunk_start_sample = chunk_group[0]['start']
             chunk_end_sample = chunk_group[-1]['end']
-            enhanced_segments.append(original_waveform[:, chunk_start_sample:chunk_end_sample])
+            enhanced_segments_waveforms.append(original_waveform[:, chunk_start_sample:chunk_end_sample])
             
     enhanced_audio_path = temp_dir / "enhanced_audio.wav"
-    if enhanced_segments:
-        final_enhanced_waveform = torch.cat(enhanced_segments, dim=1)
+    if enhanced_segments_waveforms:
+        final_enhanced_waveform = torch.cat(enhanced_segments_waveforms, dim=1)
         torchaudio.save(str(enhanced_audio_path), final_enhanced_waveform, 16000)
-    else: # 如果没有任何语音片段
-        # 创建一个空文件以防止后续步骤失败
+    else:
         torchaudio.save(str(enhanced_audio_path), torch.empty(1,0), 16000)
 
     # --- STAGE 3: 内容甄别 (第二次VAD + YAMNet) ---
     update_status_callback(stage="subtitle_content_filtering", details="正在对增强音频进行内容过滤...")
+    # (这部分代码无需修改)
+    # ...
+    # ... (省略与上一版完全相同、无需修改的 STAGE 3 代码)
     vad_parameters = { "threshold": 0.4, "min_speech_duration_ms": 250, "max_speech_duration_s": 15.0, "min_silence_duration_ms": 1000, "speech_pad_ms": 150 }
     audio_data_final = decode_audio(str(enhanced_audio_path), sampling_rate=16000)
     speech_timestamps_final = get_speech_timestamps(audio_data_final, vad_options=VadOptions(**vad_parameters))
