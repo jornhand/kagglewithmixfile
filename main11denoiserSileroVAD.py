@@ -1238,7 +1238,7 @@ def main():
         log_system_event("info", "✅ 兼容的 PyTorch 安装完成。")
 
         # 【核心修改】第二步：安装其余的库
-        install_other_cmd = "pip install -q pydantic pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai requests psutil torchonnx silero"
+        install_other_cmd = "pip install -q pydantic pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai requests psutil onnxruntime silero"        
         log_system_event("info", "正在安装其余依赖库...")
         subprocess.run(install_other_cmd, shell=True, check=True)
         log_system_event("info", "✅ 其余依赖库安装完成。")
