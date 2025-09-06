@@ -34,15 +34,6 @@ from pathlib import Path
 from datetime import timedelta
 from urllib.parse import urljoin, quote, unquote
 from concurrent.futures import ThreadPoolExecutor
-# 需要新的 import
-from demucs.separate import S
-from io import StringIO
-import tensorflow_hub as hub
-import tensorflow as tf
-import numpy as np
-from speechbrain.pretrained import SepformerLSTMMaskNet as SpeechEnhancer # 更换为 SpeechBrain 模型
-
-
 # --- 多进程与队列 ---
 import multiprocessing
 from queue import Empty as QueueEmpty
@@ -51,6 +42,23 @@ from queue import Empty as QueueEmpty
 from flask import Flask, request, jsonify, Response
 import requests
 
+
+
+try:
+    from demucs.separate import S
+    import tensorflow as tf
+    import tensorflow_hub as hub
+    import numpy as np
+    from speechbrain.pretrained import SepformerLSTMMaskNet as SpeechEnhancer
+except ImportError as e:
+    # 允许启动时导入失败，因为这些库是在运行时安装的
+    # 环境检查 (check_environment) 稍后可以补充对这些库的验证
+    print(f"[警告] 预加载高级音频处理库失败: {e}。这些库将在运行时安装。")
+    S = None
+    tf = None
+    hub = None
+    np = None
+    SpeechEnhancer = None
 # --- 加密与密钥管理 ---
 # 尝试导入关键库，如果失败则在后续检查中处理
 try:
