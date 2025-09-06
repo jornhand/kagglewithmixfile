@@ -372,15 +372,15 @@ def get_speech_timestamps_silero(
     # --- 强烈推荐的生产环境参数 ---
     threshold: float = 0.5,
     min_speech_duration_ms: int = 250,
-    min_silence_duration_ms: int = 800, # 保持在这个范围！
+    min_silence_duration_ms: int = 800, # 保持在 600-900ms 范围
     speech_pad_ms: int = 200,
     # --------------------------------
     sampling_rate: int = 16000
 ) -> list[dict]:
     """
-    [生产级最终版] 使用 Silero VAD 和 VADIterator 获取语音时间戳。
-    此版本通过正确处理音频流的结束状态和增加安全检查，
-    彻底解决了“文件极大”、“文件为空”和“输入大小错误”的所有问题。
+    [最终正确版] 使用 Silero VAD 和 VADIterator 获取语音时间戳。
+    此版本通过在音频末尾添加静音来正确处理流结束，
+    彻底解决了所有已知问题（输入大小、空文件、丢失结尾）。
     """
     import torch
     import torchaudio
@@ -393,6 +393,12 @@ def get_speech_timestamps_silero(
     if wav.shape[0] > 1:
         wav = torch.mean(wav, dim=0, keepdim=True)
 
+    # 【核心修复】: 在音频末尾添加500ms的静音
+    # 这会强制 VADIterator 正确地结束最后一个语音片段
+    silence_chunk = torch.zeros(int(sampling_rate * 0.5))
+    wav = torch.cat([wav.squeeze(0), silence_chunk]).unsqueeze(0)
+
+    # --- 后续逻辑与之前正确的版本相同 ---
     vad_iterator = VADIterator(vad_model,
                                threshold=threshold,
                                sampling_rate=sampling_rate,
@@ -403,40 +409,33 @@ def get_speech_timestamps_silero(
     audio_tensor = wav.squeeze(0)
     
     timestamps = []
-    # 1. 循环处理整个音频流
+    current_speech = {}
+
     for i in range(0, len(audio_tensor), window_size_samples):
         chunk = audio_tensor[i: i + window_size_samples]
         if len(chunk) < window_size_samples:
             continue
-        # VADIterator 是有状态的，它会自动在内部合并片段
+
         speech_dict = vad_iterator(chunk, return_seconds=False)
+        
         if speech_dict:
-            timestamps.append(speech_dict)
+            if 'start' in speech_dict:
+                current_speech['start'] = speech_dict['start']
+            
+            if 'end' in speech_dict and 'start' in current_speech:
+                start_ms = current_speech['start']
+                end_ms = speech_dict['end']
+                
+                if end_ms - start_ms > min_speech_duration_ms:
+                    timestamps.append({
+                        'start': start_ms,
+                        'end': end_ms
+                    })
+                current_speech = {}
 
-    # 2. 【核心修复】: 手动“冲洗”掉最后一段可能卡在状态里的语音
-    # 这是解决边界问题和空文件的关键
-    last_speech = vad_iterator.get_speech_timestamps(audio_tensor, return_seconds=False)
-    if last_speech:
-         # 将最后冲洗出的片段与之前的结果合并，并去重
-         all_timestamps = timestamps + last_speech
-         # 使用字典来去重，因为可能有重叠
-         unique_timestamps = list({(t['start'], t['end']): t for t in all_timestamps}.values())
-         # 按开始时间排序
-         timestamps = sorted(unique_timestamps, key=lambda x: x['start'])
-    
     vad_iterator.reset_states()
+    return timestamps
 
-    # 3. 【最终过滤和安全检查】
-    final_timestamps = []
-    for ts in timestamps:
-        # 安全检查：确保时间戳有效
-        if 'start' in ts and 'end' in ts and ts['end'] > ts['start']:
-            # 长度过滤：确保片段不是无意义的噪音
-            if ts['end'] - ts['start'] > min_speech_duration_ms:
-                final_timestamps.append(ts)
-
-    return final_timestamps
-    
 # --- A. Pydantic 数据验证模型 ---
 # 用于严格验证 Gemini API 返回的 JSON 结构，确保数据质量。
 
