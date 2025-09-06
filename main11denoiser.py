@@ -33,7 +33,7 @@ import mimetypes
 from pathlib import Path
 from datetime import timedelta
 from urllib.parse import urljoin, quote, unquote
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- 多进程与队列 ---
 import multiprocessing
@@ -604,7 +604,7 @@ def _process_subtitle_batch_with_ai(
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                response = requests.post(generate_url, headers=headers, json=payload, timeout=1000)
+                response = requests.post(generate_url, headers=headers, json=payload, timeout=360)
                 
                 if response.status_code in [429, 500, 503, 504]:
                     log_system_event("warning", f"[字幕任务 {group_index+1}] 遇到可重试的 API 错误 (HTTP {response.status_code}, 尝试 {attempt + 1}/{max_retries})。", in_worker=True)
@@ -671,6 +671,7 @@ def _process_subtitle_batch_with_ai(
 def run_subtitle_extraction_pipeline(subtitle_config: dict, chunk_files: list[dict], update_status_callback: callable) -> str:
     #
     # 主调度器，负责并发处理所有音频批次并生成最终的 SRT 内容。
+    # (优化版：使用 as_completed 提高响应性和健壮性)
     #
     
     api_keys = subtitle_config.get('GEMINI_API_KEYS', [])
@@ -680,9 +681,6 @@ def run_subtitle_extraction_pipeline(subtitle_config: dict, chunk_files: list[di
     if not all([api_keys, prompt_api_url, gemini_endpoint_prefix]):
         raise ValueError("字幕配置中缺少 'GEMINI_API_KEYS', 'PROMPT_API_URL', 或 'GEMINI_API_ENDPOINT_PREFIX'。")
     
-    # 【核心修改】：移除此处的 get_dynamic_prompts 调用
-    # system_instruction, prompt_for_task = get_dynamic_prompts(prompt_api_url)
-
     total_chunks = len(chunk_files)
     if total_chunks == 0:
         log_system_event("warning", "没有检测到有效的语音片段，无法生成字幕。", in_worker=True)
@@ -695,39 +693,71 @@ def run_subtitle_extraction_pipeline(subtitle_config: dict, chunk_files: list[di
     
     all_srt_blocks = []
     
+    # 从 concurrent.futures 导入 as_completed
+    from concurrent.futures import as_completed
+
     with ThreadPoolExecutor(max_workers=SUBTITLE_CONCURRENT_REQUESTS) as executor:
-        futures = []
+        # 使用字典将 future 映射回其任务索引，便于日志记录
+        future_to_index = {}
         delay_between_submissions = 60.0 / SUBTITLE_REQUESTS_PER_MINUTE
         
+        log_system_event("info", "开始向线程池提交所有字幕任务...", in_worker=True)
         for i, group in enumerate(chunk_groups):
             api_key_for_thread = api_keys[i % len(api_keys)]
             future = executor.submit(
                 _process_subtitle_batch_with_ai,
                 group,
-                i,
+                i, # 任务索引
                 api_key_for_thread,
                 gemini_endpoint_prefix,
-                prompt_api_url  # <--- 核心修改：传递 URL 而不是提示词内容
+                prompt_api_url
             )
-            futures.append(future)
+            future_to_index[future] = i + 1  # 任务索引从1开始，更符合日志习惯
+            
+            # 在提交循环之间短暂暂停，以平滑请求速率
             if i < num_groups - 1:
                 time.sleep(delay_between_submissions)
         
-        for i, future in enumerate(futures):
+        log_system_event("info", f"所有 {num_groups} 个任务均已提交。现在开始等待并处理返回结果...", in_worker=True)
+        
+        # 使用 as_completed 迭代，哪个任务先完成就先处理哪个
+        # 这样可以避免被单个缓慢的任务阻塞整个流程
+        completed_count = 0
+        for future in as_completed(future_to_index):
+            task_index = future_to_index[future]
+            completed_count += 1
+            
             try:
+                # 获取已完成任务的结果
                 result = future.result()
                 if result:
                     all_srt_blocks.extend(result)
-                update_status_callback(stage="subtitle_transcribing", details=f"已完成 {i+1}/{num_groups} 个字幕批次...")
+                    log_system_event("info", f"已成功处理完字幕任务 {task_index} 的结果。", in_worker=True)
+                else:
+                    # 如果结果为空列表，说明该批次处理失败但被优雅捕获了
+                    log_system_event("warning", f"字幕任务 {task_index} 返回了空结果，可能在处理过程中失败。", in_worker=True)
+
+                # 更新状态回调，显示处理进度
+                update_status_callback(stage="subtitle_transcribing", details=f"已处理完 {completed_count}/{num_groups} 个字幕批次...")
+            
             except Exception as e:
-                log_system_event("error", f"一个字幕线程任务在获取结果时发生错误: {e}", in_worker=True)
+                # 捕获在 future.result() 期间可能抛出的任何异常
+                log_system_event("error", f"获取字幕任务 {task_index} 的结果时发生严重错误: {e}", in_worker=True)
+                # 即使一个任务失败，我们依然更新进度并继续处理其他任务
+                update_status_callback(stage="subtitle_transcribing", details=f"处理任务 {task_index} 失败，已处理 {completed_count}/{num_groups} 个批次...")
 
     log_system_event("info", "所有并发任务处理完成，正在整合字幕...", in_worker=True)
     
+    # 最终的排序逻辑保持不变，这是保证字幕顺序正确的关键
     all_srt_blocks.sort(key=lambda x: x["start_ms"])
+    
+    # 拼接成最终的SRT文件内容
     final_srt_lines = [f"{i + 1}\n{block['srt_line']}" for i, block in enumerate(all_srt_blocks)]
     
-    return "\n".join(final_srt_lines)
+    final_srt_content = "\n".join(final_srt_lines)
+    log_system_event("info", f"字幕整合完成，共生成 {len(all_srt_blocks)} 条字幕。", in_worker=True)
+    
+    return final_srt_content
 
 # =============================================================================
 # --- 第 5 步: MixFileCLI 客户端 ---
