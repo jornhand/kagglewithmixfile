@@ -107,7 +107,7 @@ EXCLUDE_KEYWORDS_FROM_KILL = ["jupyter", "kernel", "ipykernel", "conda", "grep"]
 # -- E. 字幕提取流程配置 --
 # 这些值未来也可以加入到加密配置中
 SUBTITLE_CHUNK_DURATION_MS = 10 * 60 * 1000  # 10分钟
-SUBTITLE_BATCH_SIZE = 40
+SUBTITLE_BATCH_SIZE = 20
 SUBTITLE_CONCURRENT_REQUESTS = 8
 SUBTITLE_REQUESTS_PER_MINUTE = 8
 
