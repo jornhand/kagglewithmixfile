@@ -369,36 +369,45 @@ def _shutdown_notebook_kernel_immediately():
 def get_speech_timestamps_silero(
     audio_path: str,
     vad_model,
-    sampling_rate: int = 16000,
     threshold: float = 0.5,
+    sampling_rate: int = 16000,
     min_speech_duration_ms: int = 250,
-    min_silence_duration_ms: int = 500,
-    speech_pad_ms: int = 100,
+    max_speech_duration_s: float = float('inf'),
+    min_silence_duration_ms: int = 100,
+    window_size_samples: int = 512,
+    speech_pad_ms: int = 30,
 ) -> list[dict]:
     """
-    使用 Silero VAD 模型获取语音时间戳。
+    [修正版] 使用 Silero VAD 模型和 VadIterator 获取语音时间戳。
+    这个版本是为 onnx=True 模型设计的。
     """
     import torch
-    
+    import torchaudio
+    from silero_vad.utils_vad import VadIterator # 导入正确的工具
+
     wav, sr = torchaudio.load(audio_path)
     if sr != sampling_rate:
-        # 重采样
         resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=sampling_rate)
         wav = resampler(wav)
+    if wav.shape[0] > 1: # 转为单声道
+        wav = torch.mean(wav, dim=0, keepdim=True)
 
-    # Silero VAD 需要的 get_speech_timestamps 函数
-    get_speech_ts_fn = vad_model.get_speech_timestamps
+    vad_iterator = VadIterator(vad_model, 
+                               threshold=threshold,
+                               sampling_rate=sampling_rate,
+                               min_silence_duration_ms=min_silence_duration_ms,
+                               speech_pad_ms=speech_pad_ms)
     
-    speech_timestamps = get_speech_ts_fn(
-        wav,
-        threshold=threshold,
-        min_speech_duration_ms=min_speech_duration_ms,
-        min_silence_duration_ms=min_silence_duration_ms,
-        speech_pad_ms=speech_pad_ms,
-        return_seconds=False  # 我们需要毫秒
-    )
+    speech_timestamps = []
+    # VadIterator 会自动处理音频流
+    for speech_dict in vad_iterator(wav.squeeze(0), return_seconds=False):
+        # speech_dict 的格式就是 {'start': ms, 'end': ms}
+        if speech_dict:
+             speech_timestamps.append(speech_dict)
+    
+    vad_iterator.reset_states() # 重置状态
     return speech_timestamps
-    
+
 # --- A. Pydantic 数据验证模型 ---
 # 用于严格验证 Gemini API 返回的 JSON 结构，确保数据质量。
 
@@ -469,37 +478,35 @@ def preprocess_audio_for_subtitles(
     update_status_callback: callable
 ) -> list[dict]:
     #
-    # 完整的音频预处理流程：提取 -> 降噪 -> VAD 切分。
-    #
-    # Args:
-    #     video_path (Path): 输入的视频文件路径。
-    #     temp_dir (Path): 用于存放所有中间文件的临时目录。
-    #     update_status_callback (callable): 用于更新任务状态的回调函数。
-    #
-    # Returns:
-    #     list[dict]: 一个包含所有有效语音片段信息的列表，
-    #                 每个元素是 {"path": str, "start_ms": int, "end_ms": int}。
-    # 
-    # Raises:
-    #     Exception: 如果在任何关键步骤（如 ffmpeg）中发生失败。
+    # [最终修正版] 集成了 Silero VAD (ONNX) 的正确用法和修复了降噪作用域问题
     #
     
-    # 1. 使用 ffmpeg 提取原始音频
+    # 【修复1】: 在函数开头导入 torch 和 torchaudio，确保子进程作用域内可用
+    import torch
+    import torchaudio
+
+    # 1. 提取音频并添加前置静音 (逻辑不变)
     update_status_callback(stage="subtitle_extract_audio", details="正在从视频中提取音频...")
     raw_audio_path = temp_dir / "raw_audio.wav"
     try:
         command = [
-            "ffmpeg", "-i", str(video_path),
-            "-ac", "1", "-ar", "16000", # 单声道, 16kHz 采样率 (语音识别标准)
+            "ffmpeg", "-i", str(video_path), "-ac", "1", "-ar", "16000",
             "-vn", "-y", "-loglevel", "error", str(raw_audio_path)
         ]
-        # 使用 subprocess.run 等待命令完成
-        process = subprocess.run(command, check=True, capture_output=True, text=True)
+        subprocess.run(command, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
         log_system_event("error", f"FFmpeg 提取音频失败。Stderr: {e.stderr}", in_worker=True)
         raise RuntimeError(f"FFmpeg 提取音频失败: {e.stderr}")
 
-    # 2. 尝试加载 AI 降噪模型
+    log_system_event("info", "正在为音频添加前置静音填充...", in_worker=True)
+    original_audio_segment = AudioSegment.from_wav(raw_audio_path)
+    silence_padding = AudioSegment.silent(duration=500)
+    padded_audio = silence_padding + original_audio_segment
+    padded_audio_path = temp_dir / "padded_audio.wav"
+    padded_audio.export(padded_audio_path, format="wav")
+    log_system_event("info", "✅ 音频前置填充完成。", in_worker=True)
+
+    # 2. 加载 AI 降噪模型 (逻辑不变)
     denoiser_model = None
     try:
         from denoiser import pretrained
@@ -509,10 +516,18 @@ def preprocess_audio_for_subtitles(
     except Exception as e:
         log_system_event("warning", f"加载 AI 降噪模型失败，将跳过降噪步骤。错误: {e}", in_worker=True)
 
-    # 3. 分块处理音频：降噪 -> VAD
+    # 【修复2】: 在循环外只加载一次 Silero VAD 模型
+    try:
+        vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad',
+                                      model='silero_vad',
+                                      force_reload=False, onnx=True)
+    except Exception as e:
+        log_system_event("error", f"加载 Silero VAD 模型失败: {e}", in_worker=True)
+        raise RuntimeError(f"无法加载 Silero VAD 模型: {e}")
+
+    # 3. 分块处理音频
     update_status_callback(stage="subtitle_vad", details="正在进行音频分块与语音检测...")
-    original_audio = AudioSegment.from_wav(raw_audio_path)
-    total_duration_ms = len(original_audio)
+    total_duration_ms = len(padded_audio)
     chunk_files = []
     chunks_dir = temp_dir / "audio_chunks"
     chunks_dir.mkdir(exist_ok=True)
@@ -524,13 +539,13 @@ def preprocess_audio_for_subtitles(
         
         log_system_event("info", f"正在处理音频总块 {i+1}/{num_chunks}...", in_worker=True)
         
-        audio_chunk = original_audio[start_time_ms:end_time_ms]
+        audio_chunk = padded_audio[start_time_ms:end_time_ms]
         temp_chunk_path = temp_dir / f"temp_chunk_{i}.wav"
         audio_chunk.export(temp_chunk_path, format="wav")
         
         processing_path = temp_chunk_path
         
-        # 3.1 AI 降噪 (如果模型加载成功)
+        # 3.1 AI 降噪 (现在应该可以正常工作了)
         if denoiser_model:
             try:
                 wav, sr = torchaudio.load(temp_chunk_path)
@@ -543,49 +558,43 @@ def preprocess_audio_for_subtitles(
             except Exception as e:
                 log_system_event("warning", f"当前块降噪失败，将使用原始音频。错误: {e}", in_worker=True)
         
-        # 3.2 VAD 语音检测
+        # 3.2 VAD 语音检测 (使用修正后的函数)
         try:
-            # 加载 Silero VAD 模型
-            import torch
-            vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad',
-                                        model='silero_vad',
-                                        force_reload=False,
-                                        onnx=True)
-            
-            # 【注意】Silero的参数与faster-whisper不同，这是推荐配置
+            # 调用新版的、使用 VadIterator 的辅助函数
             speech_timestamps = get_speech_timestamps_silero(
                 str(processing_path),
                 vad_model,
                 threshold=0.5,
-                min_speech_duration_ms=100,
-                min_silence_duration_ms=700,
-                speech_pad_ms=300
+                min_silence_duration_ms=400,
+                speech_pad_ms=200
             )
-
-            # 3.3 根据 VAD 结果切片 (这部分逻辑与方案一类似，需要校正时间戳)
+            
+            # 3.3 根据 VAD 结果从原始音频中精确切片
             for speech in speech_timestamps:
                 relative_start_ms = speech["start"]
                 relative_end_ms = speech["end"]
                 
-                # 同样需要校正时间戳
+                # 校正时间戳，减去500ms的静音填充
                 absolute_start_ms = (start_time_ms + relative_start_ms) - 500
                 absolute_end_ms = (start_time_ms + relative_end_ms) - 500
 
                 absolute_start_ms = max(0, absolute_start_ms)
                 absolute_end_ms = max(0, absolute_end_ms)
                 if absolute_end_ms <= absolute_start_ms: continue
-
-                final_chunk = original_audio[start_time_ms + relative_start_ms : start_time_ms + relative_end_ms]
+                
+                # 从原始（未填充）的 AudioSegment 对象中切片
+                final_chunk = original_audio_segment[absolute_start_ms:absolute_end_ms]
                 final_chunk_path = chunks_dir / f"chunk_{absolute_start_ms}.wav"
                 final_chunk.export(str(final_chunk_path), format="wav")
+                
                 chunk_files.append({
                     "path": str(final_chunk_path),
                     "start_ms": absolute_start_ms,
                     "end_ms": absolute_end_ms
                 })
-
         except Exception as e:
-            log_system_event("error", f"当前块 Silero VAD 处理失败: {e}", in_worker=True)
+            log_system_event("error", f"当前块 VAD 处理失败: {e}", in_worker=True)
+    
     log_system_event("info", f"音频分块处理完成，总共切分为 {len(chunk_files)} 个有效语音片段。", in_worker=True)
     return chunk_files
 
