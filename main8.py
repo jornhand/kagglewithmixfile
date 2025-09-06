@@ -566,7 +566,7 @@ def _process_subtitle_batch_with_ai(
     log_system_event("info", f"[字幕任务 {group_index+1}] 已启动...", in_worker=True)
     try:
         # 1. 构建 REST API 请求体 (payload)
-        model_name = "gemini-1.5-flash-latest"
+        model_name = "gemini-2.5-flash"
         
         generate_url = f"{gemini_endpoint_prefix.rstrip('/')}/v1beta/models/{model_name}:generateContent"
         
