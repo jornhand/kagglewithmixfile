@@ -1178,9 +1178,28 @@ def main():
     global api_client, subtitle_config_global, FRP_SERVER_ADDR, TASK_QUEUE, RESULT_QUEUE
     
     try:
+
         # --- 1. 启动前准备 ---
         log_system_event("info", "服务正在启动...")
-        run_command("pip install -q pydantic pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai requests psutil").wait()
+
+        # 【核心修改】第一步：卸载可能已存在的默认torch，并安装与Kaggle CUDA 12.1兼容的特定版本
+        install_torch_cmd = (
+            "pip uninstall -y torch torchvision torchaudio && "
+            "pip install torch==2.3.0 torchaudio==2.3.0 --index-url https://download.pytorch.org/whl/cu121"
+        )
+        log_system_event("info", "正在安装兼容的 PyTorch 版本...")
+        # 使用 subprocess.run 等待命令完成并检查错误
+        install_proc = subprocess.run(install_torch_cmd, shell=True, capture_output=True, text=True)
+        if install_proc.returncode != 0:
+            log_system_event("error", f"PyTorch 安装失败！\nStdout: {install_proc.stdout}\nStderr: {install_proc.stderr}")
+            raise RuntimeError("未能安装兼容的 PyTorch 版本。")
+        log_system_event("info", "✅ 兼容的 PyTorch 安装完成。")
+
+        # 【核心修改】第二步：安装其余的库
+        install_other_cmd = "pip install -q pydantic pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai requests psutil"
+        log_system_event("info", "正在安装其余依赖库...")
+        subprocess.run(install_other_cmd, shell=True, check=True)
+        log_system_event("info", "✅ 其余依赖库安装完成。")
         check_environment()
         
         # --- 设置多进程启动方法 ---
