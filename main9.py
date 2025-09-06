@@ -568,7 +568,7 @@ def _process_subtitle_batch_with_ai(
         system_instruction, prompt_for_task = get_dynamic_prompts(prompt_api_url)
 
         # 1. 构建 REST API 请求体 (payload) - 后续逻辑保持不变
-        model_name = "gemini-1.5-flash-latest"
+        model_name = "gemini-2.5-flash"
         
         generate_url = f"{gemini_endpoint_prefix.rstrip('/')}/v1beta/models/{model_name}:generateContent"
         
