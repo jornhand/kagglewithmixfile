@@ -476,15 +476,38 @@ def preprocess_audio_for_subtitles(
     # 在加载模型前检查
     print("🔍 尝试加载 denoiser 模型之前，检查 GPU 显存...")
     print_gpu_memory_usage()
+
+    import psutil
+
+    def print_ram_usage():
+        # 获取系统内存使用情况
+        ram = psutil.virtual_memory()
+        total_gb = ram.total / (1024**3)
+        available_gb = ram.available / (1024**3) # 可用内存，比 free 更准确
+        used_gb = ram.used / (1024**3)
+        percent = ram.percent
+        print(f"RAM Usage: Total={total_gb:.2f}GB, Available={available_gb:.2f}GB, Used={used_gb:.2f}GB ({percent}%)")
+        return available_gb
+
+
     # 2. 尝试加载 AI 降噪模型
     denoiser_model = None
     try:
         from denoiser import pretrained
+                # --- 新增监控代码 ---
+        log_system_event("info", "🔍 尝试加载 denoiser 模型之前，检查系统 RAM...")
+        print_ram_usage()
+        # -------------------
         update_status_callback(stage="subtitle_denoise", details="正在加载 AI 降噪模型...")
         denoiser_model = pretrained.dns64().cuda()
         log_system_event("info", "AI 降噪模型加载成功。")
+        # --- 新增监控代码 ---
+        log_system_event("info", "📈 加载 denoiser 模型之后，检查系统 RAM...")
+        print_ram_usage()
+        # -------------------
     except Exception as e:
         log_system_event("warning", f"加载 AI 降噪模型失败，将跳过降噪步骤。错误: {e}")
+
 
     # 3. 分块处理音频：降噪 -> VAD
     update_status_callback(stage="subtitle_vad", details="正在进行音频分块与语音检测...")
