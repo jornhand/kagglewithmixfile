@@ -372,50 +372,60 @@ def get_speech_timestamps_silero(
     threshold: float = 0.5,
     sampling_rate: int = 16000,
     min_speech_duration_ms: int = 250,
-    max_speech_duration_s: float = float('inf'),
-    min_silence_duration_ms: int = 100,
-    window_size_samples: int = 512,
-    speech_pad_ms: int = 30,
+    min_silence_duration_ms: int = 400,
+    speech_pad_ms: int = 200,
 ) -> list[dict]:
     """
-    [最终修正版] 使用 Silero VAD 模型和 VADIterator 获取语音时间戳。
-    修正了 import 路径和类名。
+    [最终正确版] 使用 Silero VAD 模型和 VADIterator 获取语音时间戳。
+    此版本通过手动分块，解决了输入样本大小的错误。
     """
     import torch
     import torchaudio
-    # 【核心修正】: 从正确的位置导入正确的类名 VADIterator
-    from silero_vad import VADIterator 
+    from silero_vad import VADIterator
 
     wav, sr = torchaudio.load(audio_path)
     if sr != sampling_rate:
         resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=sampling_rate)
         wav = resampler(wav)
-    if wav.shape[0] > 1: # 转为单声道
+    if wav.shape[0] > 1:
         wav = torch.mean(wav, dim=0, keepdim=True)
 
-    # 【核心修正】: 使用正确的类名 VADIterator
-    vad_iterator = VADIterator(vad_model, 
+    vad_iterator = VADIterator(vad_model,
                                threshold=threshold,
                                sampling_rate=sampling_rate,
                                min_silence_duration_ms=min_silence_duration_ms,
                                speech_pad_ms=speech_pad_ms)
+
+    # Silero VAD 模型期望的固定窗口大小
+    window_size_samples = 512 if sampling_rate == 16000 else 256
+    audio_tensor = wav.squeeze(0)
     
-    speech_timestamps = []
-    # VadIterator 会自动处理音频流
-    for speech_dict in vad_iterator(wav.squeeze(0), return_seconds=False):
-        # speech_dict 的格式就是 {'start': ms, 'end': ms}
+    timestamps = []
+    current_speech = {}
+
+    # 手动循环，将音频切成小块喂给 VADIterator
+    for i in range(0, len(audio_tensor), window_size_samples):
+        chunk = audio_tensor[i: i + window_size_samples]
+        if len(chunk) < window_size_samples:
+            continue  # 忽略最后不足一个窗口的碎块
+
+        speech_dict = vad_iterator(chunk, return_seconds=False)
         if speech_dict:
-             # 我们需要一个更长的静音判断来合并短句，这里手动实现
-             if speech_timestamps and speech_dict['start'] - speech_timestamps[-1]['end'] < 700:
-                 # 小于700ms的静音，合并到上一个片段
-                 speech_timestamps[-1]['end'] = speech_dict['end']
-             elif speech_dict['end'] - speech_dict['start'] > min_speech_duration_ms:
-                 # 只有当语音片段本身足够长时才添加
-                 speech_timestamps.append(speech_dict)
-    
-    vad_iterator.reset_states() # 重置状态
-    return speech_timestamps
-    
+            if 'start' in speech_dict:
+                current_speech['start'] = speech_dict['start']
+            
+            if 'end' in speech_dict and 'start' in current_speech:
+                # 只有当语音片段足够长时才记录
+                if speech_dict['end'] - current_speech['start'] > min_speech_duration_ms:
+                    timestamps.append({
+                        'start': current_speech['start'],
+                        'end': speech_dict['end']
+                    })
+                current_speech = {} # 重置
+
+    vad_iterator.reset_states()
+    return timestamps
+
 # --- A. Pydantic 数据验证模型 ---
 # 用于严格验证 Gemini API 返回的 JSON 结构，确保数据质量。
 
