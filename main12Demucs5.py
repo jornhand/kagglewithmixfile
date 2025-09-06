@@ -457,11 +457,12 @@ def preprocess_audio_for_subtitles(
 ) -> list[dict]:
     
     # 模块导入区域
+    # 【修复 1】: 导入 demucs 的 apply_model
     from demucs import pretrained
+    from demucs.apply import apply_model
     from demucs.audio import save_audio
     import tensorflow_hub as hub
     import tensorflow as tf
-    # 【核心修复】：使用正确的高级接口导入 speechbrain 模型
     from speechbrain.pretrained import SpectralMaskEnhancement
     from faster_whisper.audio import decode_audio
     from faster_whisper.vad import VadOptions, get_speech_timestamps
@@ -470,15 +471,14 @@ def preprocess_audio_for_subtitles(
     update_status_callback(stage="subtitle_init_models", details="正在初始化高级音频处理模型...")
 
     try:
-        # 【核心修复】：使用正确的接口和 hparams 文件加载模型
         speech_enhancer = SpectralMaskEnhancement.from_hparams(
-            source="speechbrain/metricgan-plus-voicebank", # 使用专为语音增强训练的 hparams
+            source="speechbrain/metricgan-plus-voicebank",
             savedir=str(temp_dir / "pretrained_models/metricgan-plus-voicebank"),
             run_opts={"device": "cuda"}
         )
         log_system_event("info", "✅ SpeechBrain 语音增强模型加载成功。", in_worker=True)
     except Exception as e:
-        log_system_event("warning", f"加载 SpeechBrain 模型失败，将跳过语音增强。错误: {e}", in_worker=True)
+        log_system_event("warning", f"加载 SpeechBrain 模型失败: {e}", in_worker=True)
         speech_enhancer = None
         
     try:
@@ -487,7 +487,7 @@ def preprocess_audio_for_subtitles(
         yamnet_class_names = [name.strip('"') for name in open(yamnet_class_map_path).read().strip().split('\n')]
         log_system_event("info", "✅ YAMNet 声音事件检测模型加载成功。", in_worker=True)
     except Exception as e:
-        log_system_event("warning", f"加载 YAMNet 模型失败，将跳过内容甄别。错误: {e}", in_worker=True)
+        log_system_event("warning", f"加载 YAMNet 模型失败: {e}", in_worker=True)
         yamnet_model = None
 
     # --- STAGE 1: 提取与粗分离 (Demucs) ---
@@ -504,17 +504,13 @@ def preprocess_audio_for_subtitles(
         log_system_event("info", "正在加载 Demucs 模型...", in_worker=True)
         demucs_model = pretrained.get_model('htdemucs_ft')
         demucs_model.cuda()
-        
         log_system_event("info", "Demucs 模型加载成功，开始处理音频...", in_worker=True)
-        wav, sr = torchaudio.load(str(raw_audio_path))
-        wav = wav.cuda()
-        if wav.shape[0] == 1:
-            wav = wav.repeat(2, 1)
 
-        with torch.no_grad():
-            sources = demucs_model(wav[None])[0]
-        
-        vocals_tensor = sources[demucs_model.sources.index('vocals')]
+        # 【修复 1】: 使用正确的 apply_model 函数
+        processed_sources = apply_model(demucs_model, tracks=[str(raw_audio_path)], device='cuda', split=True, jobs=0)[0]
+
+        # 从 demucs v4 返回的字典中按名字获取人声
+        vocals_tensor = processed_sources['vocals']
 
         vocals_path = temp_dir / "demucs_output" / (raw_audio_path.stem + "_vocals.wav")
         vocals_path.parent.mkdir(parents=True, exist_ok=True)
@@ -536,14 +532,20 @@ def preprocess_audio_for_subtitles(
     
     if speech_enhancer:
         try:
-            # SpectralMaskEnhancement 类的 API 是 enhance_file
-            enhanced_wav = speech_enhancer.enhance_file(str(enhanced_audio_path))
+            noisy_wav, sr = torchaudio.load(str(enhanced_audio_path))
+            # 【修复 2】: 确保输入是连续的，并增加batch维度
+            noisy_wav = noisy_wav.cuda().unsqueeze(0).contiguous()
+            
+            enhanced_wav = speech_enhancer.enhance_batch(noisy_wav, lengths=torch.tensor([1.0]).cuda())
+            
+            # 从 batch 维度中取出并保存
             torchaudio.save(str(enhanced_audio_path), enhanced_wav.squeeze(0).cpu(), 16000)
             log_system_event("info", "✅ 语音增强处理完成。", in_worker=True)
         except Exception as e:
             log_system_event("warning", f"SpeechBrain 增强失败: {e}", in_worker=True)
 
     # --- STAGE 3: 内容甄别 (VAD + YAMNet) ---
+    # ... (这部分代码无需修改)
     update_status_callback(stage="subtitle_content_filtering", details="正在检测语音并过滤非说话声...")
     vad_parameters = { "threshold": 0.4, "min_speech_duration_ms": 250, "max_speech_duration_s": 15.0, "min_silence_duration_ms": 1000, "speech_pad_ms": 150 }
     audio_data = decode_audio(str(enhanced_audio_path), sampling_rate=16000)
@@ -563,7 +565,6 @@ def preprocess_audio_for_subtitles(
         
         if yamnet_model and len(segment_audio) > 0:
             segment_samples = np.array(segment_audio.get_array_of_samples()).astype(np.float32) / (1 << 15)
-            # YAMNet 需要单声道音频
             if segment_audio.channels > 1:
                 segment_samples = segment_samples.reshape((-1, segment_audio.channels)).mean(axis=1)
 
