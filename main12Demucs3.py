@@ -48,7 +48,10 @@ import requests
 # --- 新增：高级音频处理库导入 ---
 # =============================================================================
 try:
-    from demucs.separate import S
+    from demucs.apply import apply_model
+    from demucs.models import anaconda_demucs
+    from demucs.audio import save_audio
+    from demucs import pretrained
     import tensorflow as tf
     import tensorflow_hub as hub
     from speechbrain.pretrained import SepformerLSTMMaskNet as SpeechEnhancer
@@ -447,16 +450,15 @@ def read_and_encode_file_base64(filepath: str) -> str | None:
 
 # --- C. 音频预处理管道 ---
 
-
 def preprocess_audio_for_subtitles(
     video_path: Path,
     temp_dir: Path,
     update_status_callback: callable
 ) -> list[dict]:
     
-    # 【核心修复】：在子进程函数内部，强制重新导入可能在启动时为None的模块
-    # 这确保了即使父进程中这些变量是None，子进程也能获取到正确的模块
-    from demucs.separate import S
+    # 【核心修复】：在子进程函数内部，强制重新导入模块
+    from demucs import pretrained
+    from demucs.audio import save_audio
     import tensorflow_hub as hub
     import tensorflow as tf
     from speechbrain.pretrained import SepformerLSTMMaskNet as SpeechEnhancer
@@ -466,19 +468,17 @@ def preprocess_audio_for_subtitles(
     # --- STAGE 0: 初始化模型 ---
     update_status_callback(stage="subtitle_init_models", details="正在初始化高级音频处理模型...")
 
-    # 加载 SpeechBrain 语音增强模型
     try:
         speech_enhancer = SpeechEnhancer.from_hparams(
             source="speechbrain/sepformer-dns4-16k-enhancement",
             savedir=str(temp_dir / "pretrained_models/sepformer-dns4-16k-enhancement"),
-            run_opts={"device": "cuda"} # 明确指定设备
+            run_opts={"device": "cuda"}
         )
         log_system_event("info", "✅ SpeechBrain 语音增强模型加载成功。", in_worker=True)
     except Exception as e:
         log_system_event("warning", f"加载 SpeechBrain 模型失败，将跳过语音增强。错误: {e}", in_worker=True)
         speech_enhancer = None
         
-    # 加载 YAMNet 声音事件检测模型
     try:
         yamnet_model = hub.load('https://tfhub.dev/google/yamnet/1')
         yamnet_class_map_path = yamnet_model.class_map_path().numpy().decode('utf-8')
@@ -497,40 +497,49 @@ def preprocess_audio_for_subtitles(
     except subprocess.CalledProcessError as e: raise RuntimeError(f"FFmpeg 提取音频失败: {e.stderr}")
 
     update_status_callback(stage="subtitle_demucs_separation", details="正在使用 Demucs 分离人声...")
-    demucs_args = [ "-n", "htdemucs_ft", "--two-stems", "vocals", "-d", "cuda", "--out", str(temp_dir / "demucs_output"), str(raw_audio_path) ]
-    old_stdout, sys.stdout = sys.stdout, StringIO()
-    try:
-        S.sub_run(demucs_args)
-    except Exception as demucs_error:
-        # 增加对 Demucs 失败的捕获，防止整个任务中断
-        log_system_event("error", f"Demucs 执行失败: {demucs_error}", in_worker=True)
-    finally:
-        sys.stdout = old_stdout
     
-    vocals_path = temp_dir / "demucs_output" / "htdemucs_ft" / raw_audio_path.stem / "vocals.wav"
-    if not vocals_path.exists():
-        log_system_event("warning", "Demucs未能分离人声，将使用原始音频。", in_worker=True)
-        processing_audio_path = raw_audio_path
-    else:
-        log_system_event("info", "✅ Demucs 成功分离人声。", in_worker=True)
+    try:
+        log_system_event("info", "正在加载 Demucs 模型...", in_worker=True)
+        demucs_model = pretrained.get_model('htdemucs_ft')
+        demucs_model.cuda()
+        
+        log_system_event("info", "Demucs 模型加载成功，开始处理音频...", in_worker=True)
+        wav, sr = torchaudio.load(str(raw_audio_path))
+        wav = wav.cuda()
+        if wav.shape[0] == 1:
+            wav = wav.repeat(2, 1)
+
+        with torch.no_grad():
+            sources = demucs_model(wav[None])[0]
+        
+        vocals_tensor = sources[demucs_model.sources.index('vocals')]
+
+        vocals_path = temp_dir / "demucs_output" / (raw_audio_path.stem + "_vocals.wav")
+        vocals_path.parent.mkdir(parents=True, exist_ok=True)
+        save_audio(vocals_tensor.cpu(), str(vocals_path), samplerate=demucs_model.samplerate)
+        
         processing_audio_path = vocals_path
+        log_system_event("info", "✅ Demucs 成功分离人声。", in_worker=True)
+
+    except Exception as demucs_error:
+        log_system_event("error", f"Demucs 执行失败: {demucs_error}", in_worker=True)
+        log_system_event("warning", "将使用原始音频继续处理。", in_worker=True)
+        processing_audio_path = raw_audio_path
         
     # --- STAGE 2: 统一格式并进行精细语音增强 (SpeechBrain) ---
     update_status_callback(stage="subtitle_speech_enhancement", details="正在进行深度语音增强...")
-    # 转换到模型所需的 16kHz 单声道
     enhanced_audio_path = temp_dir / "enhanced_audio.wav"
     ffmpeg_resample_cmd = [ "ffmpeg", "-i", str(processing_audio_path), "-ac", "1", "-ar", "16000", "-y", "-loglevel", "error", str(enhanced_audio_path)]
     subprocess.run(ffmpeg_resample_cmd, check=True)
     
     if speech_enhancer:
         try:
-            # SpeechBrain v0.5.16 的 API 需要 tensor 输入
             waveform, sr = torchaudio.load(str(enhanced_audio_path))
             enhanced_wav = speech_enhancer.enhance_batch(waveform.cuda(), lengths=torch.tensor([1.0]).cuda())
             torchaudio.save(str(enhanced_audio_path), enhanced_wav.squeeze(0).cpu(), 16000)
             log_system_event("info", "✅ 语音增强处理完成。", in_worker=True)
         except Exception as e:
-            log_system_event("warning", f"SpeechBrain 增强失败，将使用未增强的音频。错误: {e}", in_worker=True)
+            log_system_event("warning", f"SpeechBrain 增强失败: {e}", in_worker=True)
 
     # --- STAGE 3: 内容甄别 (VAD + YAMNet) ---
     update_status_callback(stage="subtitle_content_filtering", details="正在检测语音并过滤非说话声...")
@@ -558,9 +567,6 @@ def preprocess_audio_for_subtitles(
             top_classes = [yamnet_class_names[i] for i in top5_indices]
 
             undesired_sounds = {"Shout", "Yell", "Groan", "Sigh", "Screaming", "Crying, sobbing"}
-            
-            # 改进的甄别逻辑：如果最高分的分类是不期望的声音，
-            # 并且"Speech"不在前两名的分类中，则过滤掉。
             if top_classes[0] in undesired_sounds and "Speech" not in top_classes[:2]:
                 log_system_event("info", f"过滤掉片段 {start_ms}ms - {end_ms}ms (检测为: {top_classes[0]})", in_worker=True)
                 is_speech_flag = False
