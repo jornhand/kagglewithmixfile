@@ -366,7 +366,39 @@ def _shutdown_notebook_kernel_immediately():
 # =============================================================================
 # --- 第 4 步: 字幕提取核心模块 (在子进程中调用) ---
 # =============================================================================
+def get_speech_timestamps_silero(
+    audio_path: str,
+    vad_model,
+    sampling_rate: int = 16000,
+    threshold: float = 0.5,
+    min_speech_duration_ms: int = 250,
+    min_silence_duration_ms: int = 500,
+    speech_pad_ms: int = 100,
+) -> list[dict]:
+    """
+    使用 Silero VAD 模型获取语音时间戳。
+    """
+    import torch
+    
+    wav, sr = torchaudio.load(audio_path)
+    if sr != sampling_rate:
+        # 重采样
+        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=sampling_rate)
+        wav = resampler(wav)
 
+    # Silero VAD 需要的 get_speech_timestamps 函数
+    get_speech_ts_fn = vad_model.get_speech_timestamps
+    
+    speech_timestamps = get_speech_ts_fn(
+        wav,
+        threshold=threshold,
+        min_speech_duration_ms=min_speech_duration_ms,
+        min_silence_duration_ms=min_silence_duration_ms,
+        speech_pad_ms=speech_pad_ms,
+        return_seconds=False  # 我们需要毫秒
+    )
+    return speech_timestamps
+    
 # --- A. Pydantic 数据验证模型 ---
 # 用于严格验证 Gemini API 返回的 JSON 结构，确保数据质量。
 
@@ -513,28 +545,37 @@ def preprocess_audio_for_subtitles(
         
         # 3.2 VAD 语音检测
         try:
-            from faster_whisper.audio import decode_audio
-            from faster_whisper.vad import VadOptions, get_speech_timestamps
+            # 加载 Silero VAD 模型
+            import torch
+            vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad',
+                                        model='silero_vad',
+                                        force_reload=False,
+                                        onnx=True)
             
-            vad_parameters = {
-                "threshold": 0.4, 
-                "min_speech_duration_ms": 150, 
-                "max_speech_duration_s": 15.0, # 稍微放宽以容纳长句
-                "min_silence_duration_ms": 1500, 
-                "speech_pad_ms": 150
-            }
-            sampling_rate = 16000
-            audio_data = decode_audio(str(processing_path), sampling_rate=sampling_rate)
-            speech_timestamps = get_speech_timestamps(audio_data, vad_options=VadOptions(**vad_parameters))
-            
-            # 3.3 根据 VAD 结果从原始音频中精确切片
+            # 【注意】Silero的参数与faster-whisper不同，这是推荐配置
+            speech_timestamps = get_speech_timestamps_silero(
+                str(processing_path),
+                vad_model,
+                threshold=0.5,
+                min_speech_duration_ms=100,
+                min_silence_duration_ms=700,
+                speech_pad_ms=300
+            )
+
+            # 3.3 根据 VAD 结果切片 (这部分逻辑与方案一类似，需要校正时间戳)
             for speech in speech_timestamps:
-                relative_start_ms = int(speech["start"] / sampling_rate * 1000)
-                relative_end_ms = int(speech["end"] / sampling_rate * 1000)
-                absolute_start_ms = start_time_ms + relative_start_ms
-                absolute_end_ms = start_time_ms + relative_end_ms
+                relative_start_ms = speech["start"]
+                relative_end_ms = speech["end"]
                 
-                final_chunk = original_audio[absolute_start_ms:absolute_end_ms]
+                # 同样需要校正时间戳
+                absolute_start_ms = (start_time_ms + relative_start_ms) - 500
+                absolute_end_ms = (start_time_ms + relative_end_ms) - 500
+
+                absolute_start_ms = max(0, absolute_start_ms)
+                absolute_end_ms = max(0, absolute_end_ms)
+                if absolute_end_ms <= absolute_start_ms: continue
+
+                final_chunk = original_audio[start_time_ms + relative_start_ms : start_time_ms + relative_end_ms]
                 final_chunk_path = chunks_dir / f"chunk_{absolute_start_ms}.wav"
                 final_chunk.export(str(final_chunk_path), format="wav")
                 chunk_files.append({
@@ -542,9 +583,9 @@ def preprocess_audio_for_subtitles(
                     "start_ms": absolute_start_ms,
                     "end_ms": absolute_end_ms
                 })
+
         except Exception as e:
-            log_system_event("error", f"当前块 VAD 处理失败: {e}", in_worker=True)
-    
+            log_system_event("error", f"当前块 Silero VAD 处理失败: {e}", in_worker=True)
     log_system_event("info", f"音频分块处理完成，总共切分为 {len(chunk_files)} 个有效语音片段。", in_worker=True)
     return chunk_files
 
@@ -1197,7 +1238,7 @@ def main():
         log_system_event("info", "✅ 兼容的 PyTorch 安装完成。")
 
         # 【核心修改】第二步：安装其余的库
-        install_other_cmd = "pip install -q pydantic pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai requests psutil"
+        install_other_cmd = "pip install -q pydantic pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai requests psutil torchonnx silero"
         log_system_event("info", "正在安装其余依赖库...")
         subprocess.run(install_other_cmd, shell=True, check=True)
         log_system_event("info", "✅ 其余依赖库安装完成。")
