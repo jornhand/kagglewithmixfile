@@ -457,7 +457,6 @@ def preprocess_audio_for_subtitles(
 ) -> list[dict]:
     
     # 模块导入区域
-    # 【修复 1】: 导入 demucs 的 apply_model
     from demucs import pretrained
     from demucs.apply import apply_model
     from demucs.audio import save_audio
@@ -467,7 +466,9 @@ def preprocess_audio_for_subtitles(
     from faster_whisper.audio import decode_audio
     from faster_whisper.vad import VadOptions, get_speech_timestamps
 
-    # --- STAGE 0: 初始化模型 ---
+    # --- STAGE 0: 初始化模型 (不变) ---
+    # ... (此处省略与上一版完全相同的模型加载代码，以节省篇幅) ...
+    # ... (请确保您的代码中保留了这部分)
     update_status_callback(stage="subtitle_init_models", details="正在初始化高级音频处理模型...")
 
     try:
@@ -490,79 +491,123 @@ def preprocess_audio_for_subtitles(
         log_system_event("warning", f"加载 YAMNet 模型失败: {e}", in_worker=True)
         yamnet_model = None
 
-    # --- STAGE 1: 提取与粗分离 (Demucs) ---
+
+    # --- STAGE 1: 提取与粗分离 (Demucs) (不变) ---
+    # ... (此处省略与上一版完全相同的 Demucs 代码) ...
+    # ... (请确保您的代码中保留了这部分)
     update_status_callback(stage="subtitle_extract_audio", details="正在提取原始音频...")
     raw_audio_path = temp_dir / "raw_audio.wav"
     try:
         command = [ "ffmpeg", "-i", str(video_path), "-ac", "2", "-ar", "44100", "-vn", "-y", "-loglevel", "error", str(raw_audio_path) ]
         subprocess.run(command, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e: raise RuntimeError(f"FFmpeg 提取音频失败: {e.stderr}")
-
-    update_status_callback(stage="subtitle_demucs_separation", details="正在使用 Demucs 分离人声...")
     
+    update_status_callback(stage="subtitle_demucs_separation", details="正在使用 Demucs 分离人声...")
     try:
         log_system_event("info", "正在加载 Demucs 模型...", in_worker=True)
         demucs_model = pretrained.get_model('htdemucs_ft')
         demucs_model.cuda()
         log_system_event("info", "Demucs 模型加载成功，开始处理音频...", in_worker=True)
-
-        # 【修复 1】: 使用正确的 apply_model 函数
-        processed_sources = apply_model(demucs_model, tracks=[str(raw_audio_path)], device='cuda', split=True, jobs=0)[0]
-
-        # 从 demucs v4 返回的字典中按名字获取人声
-        vocals_tensor = processed_sources['vocals']
-
+        model_out = apply_model(demucs_model, [str(raw_audio_path)], device='cuda', split=True, jobs=0)
+        if model_out: vocals_tensor = model_out[0]['vocals']
+        else: raise RuntimeError("Demucs aooly_model 未返回有效结果")
         vocals_path = temp_dir / "demucs_output" / (raw_audio_path.stem + "_vocals.wav")
         vocals_path.parent.mkdir(parents=True, exist_ok=True)
         save_audio(vocals_tensor.cpu(), str(vocals_path), samplerate=demucs_model.samplerate)
-        
         processing_audio_path = vocals_path
         log_system_event("info", "✅ Demucs 成功分离人声。", in_worker=True)
-
     except Exception as demucs_error:
         log_system_event("error", f"Demucs 执行失败: {demucs_error}", in_worker=True)
         log_system_event("warning", "将使用原始音频继续处理。", in_worker=True)
         processing_audio_path = raw_audio_path
         
-    # --- STAGE 2: 统一格式并进行精细语音增强 (SpeechBrain) ---
-    update_status_callback(stage="subtitle_speech_enhancement", details="正在进行深度语音增强...")
-    enhanced_audio_path = temp_dir / "enhanced_audio.wav"
-    ffmpeg_resample_cmd = [ "ffmpeg", "-i", str(processing_audio_path), "-ac", "1", "-ar", "16000", "-y", "-loglevel", "error", str(enhanced_audio_path)]
+        
+    # --- STAGE 2: 基于VAD的智能分块与语音增强 ---
+    update_status_callback(stage="subtitle_smart_chunking", details="正在进行智能分块...")
+    
+    # 首先将音频统一到16kHz单声道
+    mono_16k_audio_path = temp_dir / "mono_16k_audio.wav"
+    ffmpeg_resample_cmd = [ "ffmpeg", "-i", str(processing_audio_path), "-ac", "1", "-ar", "16000", "-y", "-loglevel", "error", str(mono_16k_audio_path)]
     subprocess.run(ffmpeg_resample_cmd, check=True)
     
+    # 第一次VAD：用于分块
+    log_system_event("info", "正在运行第一次VAD以进行智能分块...", in_worker=True)
+    audio_data_for_chunking = decode_audio(str(mono_16k_audio_path), sampling_rate=16000)
+    # 使用较宽松的VAD参数来获取语音边界
+    chunk_vad_options = VadOptions(min_silence_duration_ms=500)
+    speech_segments = get_speech_timestamps(audio_data_for_chunking, vad_options=chunk_vad_options)
+
+    # 智能合并算法
+    max_chunk_duration_s = 300  # 每个大块最长 300 秒 (5分钟)
+    smart_chunks = []
+    current_chunk = []
+    current_duration = 0
+
+    for seg in speech_segments:
+        seg_duration = (seg['end'] - seg['start']) / 16000.0
+        if current_duration + seg_duration > max_chunk_duration_s and len(current_chunk) > 0:
+            smart_chunks.append(current_chunk)
+            current_chunk = []
+            current_duration = 0
+        current_chunk.append(seg)
+        current_duration += seg_duration
+    if len(current_chunk) > 0:
+        smart_chunks.append(current_chunk)
+
+    log_system_event("info", f"智能分块完成，共得到 {len(smart_chunks)} 个大块。", in_worker=True)
+    
+    # 对每个大块进行增强，然后拼接回一个文件
+    original_waveform, sr = torchaudio.load(str(mono_16k_audio_path))
+    enhanced_segments = []
+
     if speech_enhancer:
-        try:
-            noisy_wav, sr = torchaudio.load(str(enhanced_audio_path))
-            # 【修复 2】: 确保输入是连续的，并增加batch维度
-            noisy_wav = noisy_wav.cuda().unsqueeze(0).contiguous()
+        update_status_callback(stage="subtitle_speech_enhancement", details=f"正在增强 {len(smart_chunks)} 个大块...")
+        for i, chunk_group in enumerate(smart_chunks):
+            chunk_start_sample = chunk_group[0]['start']
+            chunk_end_sample = chunk_group[-1]['end']
+            waveform_chunk = original_waveform[:, chunk_start_sample:chunk_end_sample]
             
-            enhanced_wav = speech_enhancer.enhance_batch(noisy_wav, lengths=torch.tensor([1.0]).cuda())
+            try:
+                enhanced_chunk = speech_enhancer.enhance_batch(
+                    waveform_chunk.cuda().unsqueeze(0).contiguous(), 
+                    lengths=torch.tensor([1.0]).cuda()
+                ).squeeze(0).cpu()
+                enhanced_segments.append(enhanced_chunk)
+                log_system_event("info", f"大块 {i+1}/{len(smart_chunks)} 增强完成。", in_worker=True)
+            except Exception as e:
+                log_system_event("warning", f"增强大块 {i+1} 失败: {e}，将使用原始音频片段。", in_worker=True)
+                enhanced_segments.append(waveform_chunk) # 失败则使用原始片段
+    else: # 如果模型未加载，直接使用原始分块
+        for chunk_group in smart_chunks:
+            chunk_start_sample = chunk_group[0]['start']
+            chunk_end_sample = chunk_group[-1]['end']
+            enhanced_segments.append(original_waveform[:, chunk_start_sample:chunk_end_sample])
             
-            # 从 batch 维度中取出并保存
-            torchaudio.save(str(enhanced_audio_path), enhanced_wav.squeeze(0).cpu(), 16000)
-            log_system_event("info", "✅ 语音增强处理完成。", in_worker=True)
-        except Exception as e:
-            log_system_event("warning", f"SpeechBrain 增强失败: {e}", in_worker=True)
+    enhanced_audio_path = temp_dir / "enhanced_audio.wav"
+    if enhanced_segments:
+        final_enhanced_waveform = torch.cat(enhanced_segments, dim=1)
+        torchaudio.save(str(enhanced_audio_path), final_enhanced_waveform, 16000)
+    else: # 如果没有任何语音片段
+        # 创建一个空文件以防止后续步骤失败
+        torchaudio.save(str(enhanced_audio_path), torch.empty(1,0), 16000)
 
-    # --- STAGE 3: 内容甄别 (VAD + YAMNet) ---
-    # ... (这部分代码无需修改)
-    update_status_callback(stage="subtitle_content_filtering", details="正在检测语音并过滤非说话声...")
+    # --- STAGE 3: 内容甄别 (第二次VAD + YAMNet) ---
+    update_status_callback(stage="subtitle_content_filtering", details="正在对增强音频进行内容过滤...")
     vad_parameters = { "threshold": 0.4, "min_speech_duration_ms": 250, "max_speech_duration_s": 15.0, "min_silence_duration_ms": 1000, "speech_pad_ms": 150 }
-    audio_data = decode_audio(str(enhanced_audio_path), sampling_rate=16000)
-    speech_timestamps = get_speech_timestamps(audio_data, vad_options=VadOptions(**vad_parameters))
+    audio_data_final = decode_audio(str(enhanced_audio_path), sampling_rate=16000)
+    speech_timestamps_final = get_speech_timestamps(audio_data_final, vad_options=VadOptions(**vad_parameters))
 
-    original_audio = AudioSegment.from_wav(enhanced_audio_path)
+    final_audio_segment = AudioSegment.from_wav(enhanced_audio_path)
     chunk_files = []
     chunks_dir = temp_dir / "audio_chunks"
     chunks_dir.mkdir(exist_ok=True)
     
-    for speech in speech_timestamps:
+    for speech in speech_timestamps_final:
         start_ms = int(speech["start"] / 16000 * 1000)
         end_ms = int(speech["end"] / 16000 * 1000)
-        segment_audio = original_audio[start_ms:end_ms]
+        segment_audio = final_audio_segment[start_ms:end_ms]
         
         is_speech_flag = True
-        
         if yamnet_model and len(segment_audio) > 0:
             segment_samples = np.array(segment_audio.get_array_of_samples()).astype(np.float32) / (1 << 15)
             if segment_audio.channels > 1:
