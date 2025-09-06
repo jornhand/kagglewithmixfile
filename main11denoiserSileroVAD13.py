@@ -473,21 +473,19 @@ def read_and_encode_file_base64(filepath: str) -> str | None:
         return None
 
 # --- C. 音频预处理管道 ---
-
 def preprocess_audio_for_subtitles(
     video_path: Path,
     temp_dir: Path,
     update_status_callback: callable
 ) -> list[dict]:
-    #
-    # [最终修正版] 集成了 Silero VAD (ONNX) 的正确用法和修复了降噪作用域问题
-    #
-    
-    # 【修复1】: 在函数开头导入 torch 和 torchaudio，确保子进程作用域内可用
+    """
+    [最终正确版] 此版本彻底删除了所有“前置静音填充”和相关的时间戳修正逻辑，
+    并且在调用 VAD 函数时，使用了所有必要的、经过调优的参数。
+    """
     import torch
     import torchaudio
 
-    # 1. 提取音频并添加前置静音 (逻辑不变)
+    # 1. 直接提取原始音频，不再进行任何填充
     update_status_callback(stage="subtitle_extract_audio", details="正在从视频中提取音频...")
     raw_audio_path = temp_dir / "raw_audio.wav"
     try:
@@ -500,15 +498,9 @@ def preprocess_audio_for_subtitles(
         log_system_event("error", f"FFmpeg 提取音频失败。Stderr: {e.stderr}", in_worker=True)
         raise RuntimeError(f"FFmpeg 提取音频失败: {e.stderr}")
 
-    log_system_event("info", "正在为音频添加前置静音填充...", in_worker=True)
     original_audio_segment = AudioSegment.from_wav(raw_audio_path)
-    silence_padding = AudioSegment.silent(duration=500)
-    padded_audio = silence_padding + original_audio_segment
-    padded_audio_path = temp_dir / "padded_audio.wav"
-    padded_audio.export(padded_audio_path, format="wav")
-    log_system_event("info", "✅ 音频前置填充完成。", in_worker=True)
 
-    # 2. 加载 AI 降噪模型 (逻辑不变)
+    # 2. 加载 AI 降噪和 VAD 模型
     denoiser_model = None
     try:
         from denoiser import pretrained
@@ -518,18 +510,16 @@ def preprocess_audio_for_subtitles(
     except Exception as e:
         log_system_event("warning", f"加载 AI 降噪模型失败，将跳过降噪步骤。错误: {e}", in_worker=True)
 
-    # 【修复2】: 在循环外只加载一次 Silero VAD 模型
     try:
         vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad',
-                                      model='silero_vad',
-                                      force_reload=False, onnx=True)
+                                      model='silero_vad', force_reload=False, onnx=True)
     except Exception as e:
         log_system_event("error", f"加载 Silero VAD 模型失败: {e}", in_worker=True)
         raise RuntimeError(f"无法加载 Silero VAD 模型: {e}")
 
     # 3. 分块处理音频
     update_status_callback(stage="subtitle_vad", details="正在进行音频分块与语音检测...")
-    total_duration_ms = len(padded_audio)
+    total_duration_ms = len(original_audio_segment)
     chunk_files = []
     chunks_dir = temp_dir / "audio_chunks"
     chunks_dir.mkdir(exist_ok=True)
@@ -541,13 +531,13 @@ def preprocess_audio_for_subtitles(
         
         log_system_event("info", f"正在处理音频总块 {i+1}/{num_chunks}...", in_worker=True)
         
-        audio_chunk = padded_audio[start_time_ms:end_time_ms]
+        audio_chunk_segment = original_audio_segment[start_time_ms:end_time_ms]
         temp_chunk_path = temp_dir / f"temp_chunk_{i}.wav"
-        audio_chunk.export(temp_chunk_path, format="wav")
+        audio_chunk_segment.export(temp_chunk_path, format="wav")
         
         processing_path = temp_chunk_path
         
-        # 3.1 AI 降噪 (现在应该可以正常工作了)
+        # 3.1 AI 降噪
         if denoiser_model:
             try:
                 wav, sr = torchaudio.load(temp_chunk_path)
@@ -560,13 +550,14 @@ def preprocess_audio_for_subtitles(
             except Exception as e:
                 log_system_event("warning", f"当前块降噪失败，将使用原始音频。错误: {e}", in_worker=True)
         
-        # 3.2 VAD 语音检测 (使用修正后的函数)
+        # 3.2 VAD 语音检测
         try:
-            # 调用新版的、使用 VadIterator 的辅助函数
+            # 【核心修正】：恢复了所有关键的 VAD 调优参数
             speech_timestamps = get_speech_timestamps_silero(
                 str(processing_path),
                 vad_model,
                 threshold=0.5,
+                min_speech_duration_ms=250,
                 min_silence_duration_ms=800,
                 speech_pad_ms=150
             )
@@ -576,15 +567,12 @@ def preprocess_audio_for_subtitles(
                 relative_start_ms = speech["start"]
                 relative_end_ms = speech["end"]
                 
-                # 校正时间戳，减去500ms的静音填充
-                absolute_start_ms = (start_time_ms + relative_start_ms) - 500
-                absolute_end_ms = (start_time_ms + relative_end_ms) - 500
-
-                absolute_start_ms = max(0, absolute_start_ms)
-                absolute_end_ms = max(0, absolute_end_ms)
-                if absolute_end_ms <= absolute_start_ms: continue
+                absolute_start_ms = start_time_ms + relative_start_ms
+                absolute_end_ms = start_time_ms + relative_end_ms
                 
-                # 从原始（未填充）的 AudioSegment 对象中切片
+                if absolute_end_ms <= absolute_start_ms:
+                    continue
+
                 final_chunk = original_audio_segment[absolute_start_ms:absolute_end_ms]
                 final_chunk_path = chunks_dir / f"chunk_{absolute_start_ms}.wav"
                 final_chunk.export(str(final_chunk_path), format="wav")
