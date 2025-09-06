@@ -593,7 +593,7 @@ def preprocess_audio_for_subtitles(
                 str(processing_path),
                 vad_model,
                 threshold=0.5,
-                min_silence_duration_ms=250,
+                min_silence_duration_ms=1500,
                 speech_pad_ms=150
             )
             
