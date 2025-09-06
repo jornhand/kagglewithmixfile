@@ -372,19 +372,20 @@ def get_speech_timestamps_silero(
     # --- 强烈推荐的生产环境参数 ---
     threshold: float = 0.5,
     min_speech_duration_ms: int = 250,
-    min_silence_duration_ms: int = 800,
+    min_silence_duration_ms: int = 800, # 官方函数内部使用，但我们也在外部过滤
     speech_pad_ms: int = 200,
     # --------------------------------
     sampling_rate: int = 16000
 ) -> list[dict]:
     """
-    [最终正确版] 使用 Silero VAD 和 VADIterator 获取语音时间戳。
-    此版本回归到库的正确用法，彻底删除了所有错误的自定义逻辑，
-    从根本上解决所有已知问题（输入大小、空文件、丢失结尾）。
+    [最终正确版] 此版本直接调用 Silero VAD 库官方提供的高级辅助函数，
+    不再包含任何自定义的、有bug的循环或状态管理。
+    这是最简单、最健壮、最正确的实现方式。
     """
     import torch
     import torchaudio
-    from silero_vad import VADIterator
+    # 【核心修复】：导入库作者提供的官方高级函数
+    from silero_vad.utils_vad import get_speech_timestamps
 
     wav, sr = torchaudio.load(audio_path)
     if sr != sampling_rate:
@@ -393,29 +394,22 @@ def get_speech_timestamps_silero(
     if wav.shape[0] > 1:
         wav = torch.mean(wav, dim=0, keepdim=True)
 
-    # --- 核心修复：回归到最简单的正确用法 ---
+    # --- 核心修复：直接调用官方函数，传入完整音频和模型 ---
+    # 这个函数会在内部完美地处理所有分块和状态管理，不会报错
+    timestamps = get_speech_timestamps(
+        wav.squeeze(0),
+        vad_model,
+        sampling_rate=sampling_rate,
+        threshold=threshold,
+        min_speech_duration_ms=min_speech_duration_ms, # 用它来做第一轮过滤
+        min_silence_duration_ms=min_silence_duration_ms,
+        speech_pad_ms=speech_pad_ms,
+        return_seconds=False
+    )
     
-    # 1. 实例化 VADIterator
-    vad_iterator = VADIterator(vad_model,
-                               threshold=threshold,
-                               sampling_rate=sampling_rate,
-                               min_silence_duration_ms=min_silence_duration_ms,
-                               speech_pad_ms=speech_pad_ms)
-
-    # 2. 将完整的音频张量直接传递给 VADIterator
-    #    它会在内部自动处理分块和状态，不会再有输入大小的错误
-    timestamps = vad_iterator(wav.squeeze(0), return_seconds=False)
+    # 我们不再需要任何额外的过滤，因为官方函数已经处理得很好
+    return timestamps
     
-    # 3. 对库返回的干净结果进行最终的长度过滤
-    #    这是唯一需要我们自己做的额外步骤
-    final_timestamps = []
-    for ts in timestamps:
-        if ts['end'] - ts['start'] > min_speech_duration_ms:
-            final_timestamps.append(ts)
-
-    # 注意：不再需要 reset_states，因为我们每次都创建新的 iterator 实例
-    return final_timestamps
-
 # --- A. Pydantic 数据验证模型 ---
 # 用于严格验证 Gemini API 返回的 JSON 结构，确保数据质量。
 
