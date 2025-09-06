@@ -44,21 +44,21 @@ import requests
 
 
 
+# =============================================================================
+# --- 新增：高级音频处理库导入 ---
+# =============================================================================
 try:
     from demucs.separate import S
     import tensorflow as tf
     import tensorflow_hub as hub
-    import numpy as np
     from speechbrain.pretrained import SepformerLSTMMaskNet as SpeechEnhancer
 except ImportError as e:
-    # 允许启动时导入失败，因为这些库是在运行时安装的
-    # 环境检查 (check_environment) 稍后可以补充对这些库的验证
     print(f"[警告] 预加载高级音频处理库失败: {e}。这些库将在运行时安装。")
-    S = None
-    tf = None
-    hub = None
-    np = None
-    SpeechEnhancer = None
+    S, tf, hub, SpeechEnhancer = None, None, None, None # 保持单行赋值
+# =============================================================================
+
+
+
 # --- 加密与密钥管理 ---
 # 尝试导入关键库，如果失败则在后续检查中处理
 try:
@@ -453,6 +453,16 @@ def preprocess_audio_for_subtitles(
     temp_dir: Path,
     update_status_callback: callable
 ) -> list[dict]:
+    
+    # 【核心修复】：在子进程函数内部，强制重新导入可能在启动时为None的模块
+    # 这确保了即使父进程中这些变量是None，子进程也能获取到正确的模块
+    from demucs.separate import S
+    import tensorflow_hub as hub
+    import tensorflow as tf
+    from speechbrain.pretrained import SepformerLSTMMaskNet as SpeechEnhancer
+    from faster_whisper.audio import decode_audio
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
     # --- STAGE 0: 初始化模型 ---
     update_status_callback(stage="subtitle_init_models", details="正在初始化高级音频处理模型...")
 
@@ -461,7 +471,8 @@ def preprocess_audio_for_subtitles(
         speech_enhancer = SpeechEnhancer.from_hparams(
             source="speechbrain/sepformer-dns4-16k-enhancement",
             savedir=str(temp_dir / "pretrained_models/sepformer-dns4-16k-enhancement"),
-        ).cuda()
+            run_opts={"device": "cuda"} # 明确指定设备
+        )
         log_system_event("info", "✅ SpeechBrain 语音增强模型加载成功。", in_worker=True)
     except Exception as e:
         log_system_event("warning", f"加载 SpeechBrain 模型失败，将跳过语音增强。错误: {e}", in_worker=True)
@@ -483,13 +494,16 @@ def preprocess_audio_for_subtitles(
     try:
         command = [ "ffmpeg", "-i", str(video_path), "-ac", "2", "-ar", "44100", "-vn", "-y", "-loglevel", "error", str(raw_audio_path) ]
         subprocess.run(command, check=True, capture_output=True, text=True)
-    except Exception as e: raise RuntimeError(f"FFmpeg 提取音频失败: {e.stderr}")
+    except subprocess.CalledProcessError as e: raise RuntimeError(f"FFmpeg 提取音频失败: {e.stderr}")
 
     update_status_callback(stage="subtitle_demucs_separation", details="正在使用 Demucs 分离人声...")
     demucs_args = [ "-n", "htdemucs_ft", "--two-stems", "vocals", "-d", "cuda", "--out", str(temp_dir / "demucs_output"), str(raw_audio_path) ]
     old_stdout, sys.stdout = sys.stdout, StringIO()
     try:
         S.sub_run(demucs_args)
+    except Exception as demucs_error:
+        # 增加对 Demucs 失败的捕获，防止整个任务中断
+        log_system_event("error", f"Demucs 执行失败: {demucs_error}", in_worker=True)
     finally:
         sys.stdout = old_stdout
     
@@ -508,10 +522,11 @@ def preprocess_audio_for_subtitles(
     ffmpeg_resample_cmd = [ "ffmpeg", "-i", str(processing_audio_path), "-ac", "1", "-ar", "16000", "-y", "-loglevel", "error", str(enhanced_audio_path)]
     subprocess.run(ffmpeg_resample_cmd, check=True)
     
-    # 如果语音增强模型加载成功，则使用它
     if speech_enhancer:
         try:
-            enhanced_wav = speech_enhancer.enhance_file(str(enhanced_audio_path))
+            # SpeechBrain v0.5.16 的 API 需要 tensor 输入
+            waveform, sr = torchaudio.load(str(enhanced_audio_path))
+            enhanced_wav = speech_enhancer.enhance_batch(waveform.cuda(), lengths=torch.tensor([1.0]).cuda())
             torchaudio.save(str(enhanced_audio_path), enhanced_wav.squeeze(0).cpu(), 16000)
             log_system_event("info", "✅ 语音增强处理完成。", in_worker=True)
         except Exception as e:
@@ -519,55 +534,45 @@ def preprocess_audio_for_subtitles(
 
     # --- STAGE 3: 内容甄别 (VAD + YAMNet) ---
     update_status_callback(stage="subtitle_content_filtering", details="正在检测语音并过滤非说话声...")
-    from faster_whisper.audio import decode_audio
-    from faster_whisper.vad import VadOptions, get_speech_timestamps
-
     vad_parameters = { "threshold": 0.4, "min_speech_duration_ms": 250, "max_speech_duration_s": 15.0, "min_silence_duration_ms": 1000, "speech_pad_ms": 150 }
-    sampling_rate = 16000
-    audio_data = decode_audio(str(enhanced_audio_path), sampling_rate=sampling_rate)
+    audio_data = decode_audio(str(enhanced_audio_path), sampling_rate=16000)
     speech_timestamps = get_speech_timestamps(audio_data, vad_options=VadOptions(**vad_parameters))
 
     original_audio = AudioSegment.from_wav(enhanced_audio_path)
-    total_duration_ms = len(original_audio)
     chunk_files = []
     chunks_dir = temp_dir / "audio_chunks"
     chunks_dir.mkdir(exist_ok=True)
     
-    # 遍历VAD找到的所有声音片段
     for speech in speech_timestamps:
-        start_ms = int(speech["start"] / sampling_rate * 1000)
-        end_ms = int(speech["end"] / sampling_rate * 1000)
-        
+        start_ms = int(speech["start"] / 16000 * 1000)
+        end_ms = int(speech["end"] / 16000 * 1000)
         segment_audio = original_audio[start_ms:end_ms]
         
-        is_speech_flag = True # 默认认为是说话声
+        is_speech_flag = True
         
-        # 如果 YAMNet 加载成功，则进行内容检查
         if yamnet_model and len(segment_audio) > 0:
             segment_samples = np.array(segment_audio.get_array_of_samples()).astype(np.float32) / (1 << 15)
             scores, embeddings, spectrogram = yamnet_model(segment_samples)
-            scores_np = scores.numpy().mean(axis=0) # 对时间轴取平均
+            scores_np = scores.numpy().mean(axis=0)
             top5_indices = np.argsort(scores_np)[-5:][::-1]
-            top_class_name = yamnet_class_names[top5_indices[0]]
+            top_classes = [yamnet_class_names[i] for i in top5_indices]
 
-            # 关键的甄别逻辑
             undesired_sounds = {"Shout", "Yell", "Groan", "Sigh", "Screaming", "Crying, sobbing"}
-            if top_class_name in undesired_sounds and "Speech" not in [yamnet_class_names[i] for i in top5_indices[:2]]:
-                log_system_event("info", f"过滤掉片段 {start_ms}ms - {end_ms}ms (检测为: {top_class_name})", in_worker=True)
+            
+            # 改进的甄别逻辑：如果最高分的分类是不期望的声音，
+            # 并且"Speech"不在前两名的分类中，则过滤掉。
+            if top_classes[0] in undesired_sounds and "Speech" not in top_classes[:2]:
+                log_system_event("info", f"过滤掉片段 {start_ms}ms - {end_ms}ms (检测为: {top_classes[0]})", in_worker=True)
                 is_speech_flag = False
 
         if is_speech_flag:
             final_chunk_path = chunks_dir / f"chunk_{start_ms}.wav"
             segment_audio.export(str(final_chunk_path), format="wav")
-            chunk_files.append({
-                "path": str(final_chunk_path),
-                "start_ms": start_ms,
-                "end_ms": end_ms
-            })
+            chunk_files.append({ "path": str(final_chunk_path), "start_ms": start_ms, "end_ms": end_ms })
 
     log_system_event("info", f"音频纯化处理完成，总共获得 {len(chunk_files)} 个有效说话片段。", in_worker=True)
     return chunk_files
-    
+
 # --- D. AI 交互与并发调度 ---
 
 def _process_subtitle_batch_with_ai(
