@@ -456,12 +456,13 @@ def preprocess_audio_for_subtitles(
     update_status_callback: callable
 ) -> list[dict]:
     
-    # 【核心修复】：在子进程函数内部，强制重新导入模块
+    # 模块导入区域
     from demucs import pretrained
     from demucs.audio import save_audio
     import tensorflow_hub as hub
     import tensorflow as tf
-    from speechbrain.pretrained import SepformerLSTMMaskNet as SpeechEnhancer
+    # 【核心修复】：使用正确的高级接口导入 speechbrain 模型
+    from speechbrain.pretrained import SpectralMaskEnhancement
     from faster_whisper.audio import decode_audio
     from faster_whisper.vad import VadOptions, get_speech_timestamps
 
@@ -469,9 +470,10 @@ def preprocess_audio_for_subtitles(
     update_status_callback(stage="subtitle_init_models", details="正在初始化高级音频处理模型...")
 
     try:
-        speech_enhancer = SpeechEnhancer.from_hparams(
-            source="speechbrain/sepformer-dns4-16k-enhancement",
-            savedir=str(temp_dir / "pretrained_models/sepformer-dns4-16k-enhancement"),
+        # 【核心修复】：使用正确的接口和 hparams 文件加载模型
+        speech_enhancer = SpectralMaskEnhancement.from_hparams(
+            source="speechbrain/metricgan-plus-voicebank", # 使用专为语音增强训练的 hparams
+            savedir=str(temp_dir / "pretrained_models/metricgan-plus-voicebank"),
             run_opts={"device": "cuda"}
         )
         log_system_event("info", "✅ SpeechBrain 语音增强模型加载成功。", in_worker=True)
@@ -534,8 +536,8 @@ def preprocess_audio_for_subtitles(
     
     if speech_enhancer:
         try:
-            waveform, sr = torchaudio.load(str(enhanced_audio_path))
-            enhanced_wav = speech_enhancer.enhance_batch(waveform.cuda(), lengths=torch.tensor([1.0]).cuda())
+            # SpectralMaskEnhancement 类的 API 是 enhance_file
+            enhanced_wav = speech_enhancer.enhance_file(str(enhanced_audio_path))
             torchaudio.save(str(enhanced_audio_path), enhanced_wav.squeeze(0).cpu(), 16000)
             log_system_event("info", "✅ 语音增强处理完成。", in_worker=True)
         except Exception as e:
@@ -561,6 +563,10 @@ def preprocess_audio_for_subtitles(
         
         if yamnet_model and len(segment_audio) > 0:
             segment_samples = np.array(segment_audio.get_array_of_samples()).astype(np.float32) / (1 << 15)
+            # YAMNet 需要单声道音频
+            if segment_audio.channels > 1:
+                segment_samples = segment_samples.reshape((-1, segment_audio.channels)).mean(axis=1)
+
             scores, embeddings, spectrogram = yamnet_model(segment_samples)
             scores_np = scores.numpy().mean(axis=0)
             top5_indices = np.argsort(scores_np)[-5:][::-1]
