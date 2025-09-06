@@ -378,12 +378,13 @@ def get_speech_timestamps_silero(
     speech_pad_ms: int = 30,
 ) -> list[dict]:
     """
-    [修正版] 使用 Silero VAD 模型和 VadIterator 获取语音时间戳。
-    这个版本是为 onnx=True 模型设计的。
+    [最终修正版] 使用 Silero VAD 模型和 VADIterator 获取语音时间戳。
+    修正了 import 路径和类名。
     """
     import torch
     import torchaudio
-    from silero_vad.utils_vad import VadIterator # 导入正确的工具
+    # 【核心修正】: 从正确的位置导入正确的类名 VADIterator
+    from silero_vad import VADIterator 
 
     wav, sr = torchaudio.load(audio_path)
     if sr != sampling_rate:
@@ -392,7 +393,8 @@ def get_speech_timestamps_silero(
     if wav.shape[0] > 1: # 转为单声道
         wav = torch.mean(wav, dim=0, keepdim=True)
 
-    vad_iterator = VadIterator(vad_model, 
+    # 【核心修正】: 使用正确的类名 VADIterator
+    vad_iterator = VADIterator(vad_model, 
                                threshold=threshold,
                                sampling_rate=sampling_rate,
                                min_silence_duration_ms=min_silence_duration_ms,
@@ -403,11 +405,17 @@ def get_speech_timestamps_silero(
     for speech_dict in vad_iterator(wav.squeeze(0), return_seconds=False):
         # speech_dict 的格式就是 {'start': ms, 'end': ms}
         if speech_dict:
-             speech_timestamps.append(speech_dict)
+             # 我们需要一个更长的静音判断来合并短句，这里手动实现
+             if speech_timestamps and speech_dict['start'] - speech_timestamps[-1]['end'] < 700:
+                 # 小于700ms的静音，合并到上一个片段
+                 speech_timestamps[-1]['end'] = speech_dict['end']
+             elif speech_dict['end'] - speech_dict['start'] > min_speech_duration_ms:
+                 # 只有当语音片段本身足够长时才添加
+                 speech_timestamps.append(speech_dict)
     
     vad_iterator.reset_states() # 重置状态
     return speech_timestamps
-
+    
 # --- A. Pydantic 数据验证模型 ---
 # 用于严格验证 Gemini API 返回的 JSON 结构，确保数据质量。
 
