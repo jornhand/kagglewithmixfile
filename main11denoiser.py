@@ -517,11 +517,11 @@ def preprocess_audio_for_subtitles(
             from faster_whisper.vad import VadOptions, get_speech_timestamps
             
             vad_parameters = {
-                "threshold": 0.4, 
+                "threshold": 0.38, 
                 "min_speech_duration_ms": 150, 
                 "max_speech_duration_s": 15.0, # 稍微放宽以容纳长句
                 "min_silence_duration_ms": 1500, 
-                "speech_pad_ms": 150
+                "speech_pad_ms": 500
             }
             sampling_rate = 16000
             audio_data = decode_audio(str(processing_path), sampling_rate=sampling_rate)
