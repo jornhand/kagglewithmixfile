@@ -459,6 +459,23 @@ def preprocess_audio_for_subtitles(
         log_system_event("error", f"FFmpeg 提取音频失败。Stderr: {e.stderr}")
         raise RuntimeError(f"FFmpeg 提取音频失败: {e.stderr}")
 
+
+
+    def print_gpu_memory_usage():
+        try:
+            # 使用 nvidia-smi 命令获取 GPU 状态
+            result = subprocess.run(['nvidia-smi', '--query-gpu=memory.total,memory.used,memory.free', '--format=csv,noheader,nounits'],
+                                    capture_output=True, text=True, check=True)
+            total, used, free = map(int, result.stdout.strip().split(','))
+            print(f"GPU Memory: Total={total}MB, Used={used}MB, Free={free}MB")
+            return free
+        except Exception as e:
+            print(f"无法运行 nvidia-smi: {e}. 可能未分配 GPU。")
+            return 0
+
+    # 在加载模型前检查
+    print("🔍 尝试加载 denoiser 模型之前，检查 GPU 显存...")
+    print_gpu_memory_usage()
     # 2. 尝试加载 AI 降噪模型
     denoiser_model = None
     try:
