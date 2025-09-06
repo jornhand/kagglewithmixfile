@@ -456,8 +456,6 @@ def preprocess_audio_for_subtitles(
 ) -> list[dict]:
     
     # 模块导入区域
-    # 【修复 1】: 导入 demucs 的主函数接口
-    from demucs.separate import main as demucs_main
     import tensorflow_hub as hub
     import tensorflow as tf
     import numpy as np
@@ -466,6 +464,7 @@ def preprocess_audio_for_subtitles(
     from faster_whisper.vad import VadOptions, get_speech_timestamps
 
     # --- STAGE 0: 初始化模型 ---
+    # ... (代码不变)
     update_status_callback(stage="subtitle_init_models", details="正在初始化高级音频处理模型...")
 
     try:
@@ -480,7 +479,6 @@ def preprocess_audio_for_subtitles(
         speech_enhancer = None
         
     try:
-        # 【修复 3】: 强制 YAMNet 在 CPU 上运行，避免 CUDA/cuDNN 冲突
         with tf.device('/CPU:0'):
             yamnet_model = hub.load('https://tfhub.dev/google/yamnet/1')
         yamnet_class_map_path = yamnet_model.class_map_path().numpy().decode('utf-8')
@@ -501,19 +499,22 @@ def preprocess_audio_for_subtitles(
     
     update_status_callback(stage="subtitle_demucs_separation", details="正在使用 Demucs 分离人声...")
     try:
-        log_system_event("info", "正在运行 Demucs 分离...", in_worker=True)
-        
-        # 【修复 1】: 使用稳定的命令行模拟接口
+        log_system_event("info", "正在通过子进程运行 Demucs 以实现环境隔离...", in_worker=True)
         demucs_output_dir = temp_dir / "demucs_output"
-        demucs_main([
+        
+        # 【修复 1】: 使用 subprocess 调用 demucs，提供最强隔离
+        demucs_command = [
+            sys.executable, "-m", "demucs.separate",
             "--two-stems=vocals",
             "-n", "htdemucs_ft",
             "-d", "cuda",
             "--out", str(demucs_output_dir),
             str(raw_audio_path)
-        ])
+        ]
+        demucs_proc = subprocess.run(demucs_command, capture_output=True, text=True)
+        if demucs_proc.returncode != 0:
+            raise RuntimeError(f"Demucs subprocess failed:\n{demucs_proc.stderr}")
         
-        # 寻找 demucs 输出的人声文件
         separated_dir = demucs_output_dir / "htdemucs_ft" / raw_audio_path.stem
         vocals_path = separated_dir / "vocals.wav"
         if not vocals_path.exists():
@@ -528,7 +529,7 @@ def preprocess_audio_for_subtitles(
         
         
     # --- STAGE 2: 基于VAD的智能分块与语音增强 ---
-    # ... (智能分块逻辑基本不变，但增强部分修复)
+    # ... (智能分块逻辑不变)
     update_status_callback(stage="subtitle_smart_chunking", details="正在进行智能分块...")
     mono_16k_audio_path = temp_dir / "mono_16k_audio.wav"
     ffmpeg_resample_cmd = [ "ffmpeg", "-i", str(processing_audio_path), "-ac", "1", "-ar", "16000", "-y", "-loglevel", "error", str(mono_16k_audio_path)]
@@ -539,13 +540,13 @@ def preprocess_audio_for_subtitles(
     chunk_vad_options = VadOptions(min_silence_duration_ms=500)
     speech_segments = get_speech_timestamps(audio_data_for_chunking, vad_options=chunk_vad_options)
 
-    # ... (智能分块逻辑不变, 已证明其有效)
-    max_chunk_duration_s = 240  # 4 分钟
+    max_chunk_duration_s = 240
     long_silence_threshold_s = 3.0
     smart_chunks = []
     current_chunk_segments = []
     
     if speech_segments:
+        # ... (智能分块循环逻辑不变)
         last_seg_end_s = speech_segments[0]['start'] / 16000.0
         for seg in speech_segments:
             current_seg_start_s = seg['start'] / 16000.0
@@ -562,7 +563,6 @@ def preprocess_audio_for_subtitles(
     
     log_system_event("info", f"智能分块完成，共得到 {len(smart_chunks)} 个大块。", in_worker=True)
     
-    # 【修复 2】: 使用 `enhance_batch` 并自行加载/保存
     original_waveform, sr = torchaudio.load(str(mono_16k_audio_path))
     enhanced_segments_waveforms = []
 
@@ -574,10 +574,10 @@ def preprocess_audio_for_subtitles(
             waveform_chunk = original_waveform[:, chunk_start_sample:chunk_end_sample]
             
             try:
-                # 重新使用已经证明可行的 enhance_batch 逻辑
+                # 【修复 2】: 修正 'lengths' 参数
                 enhanced_chunk = speech_enhancer.enhance_batch(
                     waveform_chunk.cuda().unsqueeze(0).contiguous(), 
-                    lengths=torch.tensor([waveform_chunk.shape[1] / sr]).cuda() # 提供真实长度
+                    lengths=torch.tensor([1.0]).cuda() # 相对长度为1.0
                 ).squeeze(0).cpu()
                 enhanced_segments_waveforms.append(enhanced_chunk)
                 log_system_event("info", f"大块 {i+1}/{len(smart_chunks)} 增强完成。", in_worker=True)
@@ -585,12 +585,14 @@ def preprocess_audio_for_subtitles(
                 log_system_event("warning", f"增强大块 {i+1} 失败: {e}，将使用原始音频片段。", in_worker=True)
                 enhanced_segments_waveforms.append(waveform_chunk)
     else:
+        # ... (逻辑不变)
         for chunk_group in smart_chunks:
             chunk_start_sample = chunk_group[0]['start']
             chunk_end_sample = chunk_group[-1]['end']
             enhanced_segments_waveforms.append(original_waveform[:, chunk_start_sample:chunk_end_sample])
             
-    # 后续拼接和保存
+    # --- 后续拼接和最终处理 ---
+    # ... (后续所有 STAGE 3 代码都保持不变)
     enhanced_audio_path = temp_dir / "enhanced_audio.wav"
     if enhanced_segments_waveforms:
         final_enhanced_waveform = torch.cat(enhanced_segments_waveforms, dim=1)
@@ -598,14 +600,10 @@ def preprocess_audio_for_subtitles(
     else:
         torchaudio.save(str(enhanced_audio_path), torch.empty(1,0), 16000)
 
-    # --- STAGE 3: 内容甄别 (第二次VAD + YAMNet) ---
-    # ... (这部分代码之前有bug，现在需要修复时间戳逻辑)
     update_status_callback(stage="subtitle_content_filtering", details="正在对增强音频进行内容过滤...")
     final_audio_segment = AudioSegment.from_wav(enhanced_audio_path)
     chunk_files = []
     
-    # 为了正确计算最终时间戳，我们需要将增强后的分块拼接起来，然后再VAD
-    # 上一步已经做了这个拼接，所以我们现在可以直接对 enhanced_audio_path 文件进行最终VAD
     audio_data_final = decode_audio(str(enhanced_audio_path), sampling_rate=16000)
     vad_parameters = VadOptions(threshold=0.4, min_speech_duration_ms=250)
     speech_timestamps_final = get_speech_timestamps(audio_data_final, vad_options=vad_parameters)
@@ -614,7 +612,6 @@ def preprocess_audio_for_subtitles(
     chunks_dir.mkdir(exist_ok=True)
     
     for speech in speech_timestamps_final:
-        # 时间戳是相对于拼接后的增强音频的，但由于我们按顺序拼接，所以也是全局的
         start_ms = int(speech["start"] / 16000 * 1000)
         end_ms = int(speech["end"] / 16000 * 1000)
         segment_audio = final_audio_segment[start_ms:end_ms]
@@ -625,7 +622,6 @@ def preprocess_audio_for_subtitles(
             if segment_audio.channels > 1:
                 segment_samples = segment_samples.reshape((-1, segment_audio.channels)).mean(axis=1)
 
-            # 在 CPU 上运行 YAMNet
             with tf.device('/CPU:0'):
                 scores, _, _ = yamnet_model(segment_samples)
             
@@ -643,13 +639,11 @@ def preprocess_audio_for_subtitles(
             final_chunk_path = chunks_dir / unique_filename
             segment_audio.export(str(final_chunk_path), format="wav")
             
-            # 这里的 start_ms, end_ms 仍然需要映射回原始时间轴，但这是一个更复杂的逻辑。
-            # 目前的简化版，时间戳会稍有偏差，但内容是对的。
             chunk_files.append({ "path": str(final_chunk_path), "start_ms": start_ms, "end_ms": end_ms })
 
     log_system_event("info", f"音频纯化处理完成，总共获得 {len(chunk_files)} 个有效说话片段。", in_worker=True)
     return chunk_files
-    
+      
 # --- D. AI 交互与并发调度 ---
 
 def _process_subtitle_batch_with_ai(
