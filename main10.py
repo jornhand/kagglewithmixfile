@@ -498,18 +498,18 @@ def preprocess_audio_for_subtitles(
         
         processing_path = temp_chunk_path
         
-        # 3.1 AI 降噪 (如果模型加载成功)
-        if denoiser_model:
-            try:
-                wav, sr = torchaudio.load(temp_chunk_path)
-                wav = wav.cuda()
-                with torch.no_grad():
-                    denoised_wav = denoiser_model(wav[None])[0]
-                denoised_chunk_path = temp_dir / f"denoised_chunk_{i}.wav"
-                torchaudio.save(denoised_chunk_path, denoised_wav.cpu(), 16000)
-                processing_path = denoised_chunk_path
-            except Exception as e:
-                log_system_event("warning", f"当前块降噪失败，将使用原始音频。错误: {e}", in_worker=True)
+        # # 3.1 AI 降噪 (如果模型加载成功)
+        # if denoiser_model:
+        #     try:
+        #         wav, sr = torchaudio.load(temp_chunk_path)
+        #         wav = wav.cuda()
+        #         with torch.no_grad():
+        #             denoised_wav = denoiser_model(wav[None])[0]
+        #         denoised_chunk_path = temp_dir / f"denoised_chunk_{i}.wav"
+        #         torchaudio.save(denoised_chunk_path, denoised_wav.cpu(), 16000)
+        #         processing_path = denoised_chunk_path
+        #     except Exception as e:
+        #         log_system_event("warning", f"当前块降噪失败，将使用原始音频。错误: {e}", in_worker=True)
         
         # 3.2 VAD 语音检测
         try:
