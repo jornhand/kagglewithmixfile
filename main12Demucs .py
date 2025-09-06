@@ -34,6 +34,14 @@ from pathlib import Path
 from datetime import timedelta
 from urllib.parse import urljoin, quote, unquote
 from concurrent.futures import ThreadPoolExecutor
+# 需要新的 import
+from demucs.separate import S
+from io import StringIO
+import tensorflow_hub as hub
+import tensorflow as tf
+import numpy as np
+from speechbrain.pretrained import SepformerLSTMMaskNet as SpeechEnhancer # 更换为 SpeechBrain 模型
+
 
 # --- 多进程与队列 ---
 import multiprocessing
@@ -431,14 +439,6 @@ def read_and_encode_file_base64(filepath: str) -> str | None:
 
 # --- C. 音频预处理管道 ---
 
-# 需要新的 import
-from demucs.separate import S
-import sys
-from io import StringIO
-import tensorflow_hub as hub
-import tensorflow as tf
-import numpy as np
-from speechbrain.pretrained import SepformerLSTMMaskNet as SpeechEnhancer # 更换为 SpeechBrain 模型
 
 def preprocess_audio_for_subtitles(
     video_path: Path,
