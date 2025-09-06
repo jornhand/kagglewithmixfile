@@ -474,15 +474,132 @@ def read_and_encode_file_base64(filepath: str) -> str | None:
 
 # --- C. 音频预处理管道 ---
 
+# def preprocess_audio_for_subtitles(
+#     video_path: Path,
+#     temp_dir: Path,
+#     update_status_callback: callable
+# ) -> list[dict]:
+#     """
+#     [最终正确版] 采用“分块降噪 + 合并后全局VAD”的混合架构。
+#     此版本经过全面审查，确保了所有关键参数都被正确使用，
+#     实现了性能、稳定性和结果质量的最佳平衡。
+#     """
+#     import torch
+#     import torchaudio
+
+#     # --- 步骤 1: 提取完整的原始音频 ---
+#     update_status_callback(stage="subtitle_extract_audio", details="正在提取完整音频...")
+#     raw_audio_path = temp_dir / "raw_audio.wav"
+#     try:
+#         command = [
+#             "ffmpeg", "-i", str(video_path), "-ac", "1", "-ar", "16000",
+#             "-vn", "-y", "-loglevel", "error", str(raw_audio_path)
+#         ]
+#         subprocess.run(command, check=True, capture_output=True, text=True)
+#     except subprocess.CalledProcessError as e:
+#         log_system_event("error", f"FFmpeg 提取音频失败。Stderr: {e.stderr}", in_worker=True)
+#         raise RuntimeError(f"FFmpeg 提取音频失败: {e.stderr}")
+
+#     original_audio_segment = AudioSegment.from_wav(raw_audio_path)
+#     processing_path = raw_audio_path # 默认使用原始音频
+
+#     # --- 步骤 2: 对音频进行分块降噪，然后合并 ---
+#     try:
+#         from denoiser import pretrained
+#         update_status_callback(stage="subtitle_denoise", details="正在加载 AI 降噪模型...")
+#         denoiser_model = pretrained.dns64().cuda()
+        
+#         denoised_full_audio = AudioSegment.silent(duration=0)
+#         num_chunks_denoise = -(-len(original_audio_segment) // SUBTITLE_CHUNK_DURATION_MS)
+#         denoise_temp_dir = temp_dir / "denoise_chunks"
+#         denoise_temp_dir.mkdir(exist_ok=True)
+
+#         for i in range(num_chunks_denoise):
+#             start_ms = i * SUBTITLE_CHUNK_DURATION_MS
+#             end_ms = min((i + 1) * SUBTITLE_CHUNK_DURATION_MS, len(original_audio_segment))
+            
+#             update_status_callback(stage="subtitle_denoise", details=f"正在降噪音频块 {i+1}/{num_chunks_denoise}...")
+            
+#             chunk_to_denoise = original_audio_segment[start_ms:end_ms]
+#             chunk_path = denoise_temp_dir / f"chunk_{i}.wav"
+#             chunk_to_denoise.export(chunk_path, format="wav")
+
+#             try:
+#                 wav, sr = torchaudio.load(chunk_path)
+#                 wav = wav.cuda()
+#                 with torch.no_grad():
+#                     denoised_wav = denoiser_model(wav[None])[0]
+                
+#                 denoised_chunk_path = denoise_temp_dir / f"denoised_chunk_{i}.wav"
+#                 torchaudio.save(denoised_chunk_path, denoised_wav.cpu(), 16000)
+#                 denoised_chunk_segment = AudioSegment.from_wav(denoised_chunk_path)
+#                 denoised_full_audio += denoised_chunk_segment
+#             except Exception as chunk_e:
+#                 log_system_event("warning", f"降噪音频块 {i+1} 失败，将使用原始音频块。错误: {chunk_e}", in_worker=True)
+#                 denoised_full_audio += chunk_to_denoise
+
+#         denoised_audio_path = temp_dir / "denoised_audio_full.wav"
+#         denoised_full_audio.export(denoised_audio_path, format="wav")
+#         processing_path = denoised_audio_path
+#         log_system_event("info", "✅ 所有音频块降噪并合并成功。", in_worker=True)
+
+#     except Exception as e:
+#         log_system_event("warning", f"降噪流程整体失败，将使用原始音频进行VAD。错误: {e}", in_worker=True)
+
+#     # --- 步骤 3: 对完整的（可能已降噪的）音频文件执行全局 VAD ---
+#     update_status_callback(stage="subtitle_vad", details="正在对完整音频进行VAD分析...")
+#     try:
+#         vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad',
+#                                       model='silero_vad', force_reload=False, onnx=True)
+        
+#         # 【核心修正】：恢复了所有关键的、经过调优的 VAD 参数
+#         global_speech_timestamps = get_speech_timestamps_silero(
+#             str(processing_path),
+#             vad_model,
+#             threshold=0.5,
+#             min_speech_duration_ms=250,
+#             min_silence_duration_ms=800,
+#             speech_pad_ms=200
+#         )
+#         log_system_event("info", f"✅ VAD分析完成，共发现 {len(global_speech_timestamps)} 个潜在语音片段。", in_worker=True)
+#     except Exception as e:
+#         log_system_event("error", f"VAD处理失败: {e}", in_worker=True)
+#         raise RuntimeError(f"VAD处理失败: {e}")
+
+#     # --- 步骤 4: 根据全局时间戳，从原始音频中精确切割 ---
+#     update_status_callback(stage="subtitle_slicing", details="正在根据VAD结果进行音频切割...")
+#     chunk_files = []
+#     chunks_dir = temp_dir / "audio_chunks"
+#     chunks_dir.mkdir(exist_ok=True)
+
+#     for speech in global_speech_timestamps:
+#         start_ms = speech["start"]
+#         end_ms = speech["end"]
+
+#         if end_ms <= start_ms: continue
+
+#         # 从原始音频（未降噪）中切割，以保证最高音质
+#         final_chunk = original_audio_segment[start_ms:end_ms]
+#         final_chunk_path = chunks_dir / f"chunk_{start_ms}.wav"
+#         final_chunk.export(str(final_chunk_path), format="wav")
+        
+#         chunk_files.append({
+#             "path": str(final_chunk_path), "start_ms": start_ms, "end_ms": end_ms
+#         })
+
+#     log_system_event("info", f"音频分块处理完成，总共切分为 {len(chunk_files)} 个有效语音片段。", in_worker=True)
+#     return chunk_files
+
+
 def preprocess_audio_for_subtitles(
     video_path: Path,
     temp_dir: Path,
     update_status_callback: callable
 ) -> list[dict]:
     """
-    [最终正确版] 采用“分块降噪 + 合并后全局VAD”的混合架构。
-    此版本经过全面审查，确保了所有关键参数都被正确使用，
-    实现了性能、稳定性和结果质量的最佳平衡。
+    [最终正确版] 此版本通过彻底移除有问题的AI降噪步骤，
+    回归到“单一文件源”的健壮架构。VAD直接处理原始音频，
+    并从同一原始音频进行切割，从根本上杜绝所有已知问题。
     """
     import torch
     import torchaudio
@@ -500,61 +617,15 @@ def preprocess_audio_for_subtitles(
         log_system_event("error", f"FFmpeg 提取音频失败。Stderr: {e.stderr}", in_worker=True)
         raise RuntimeError(f"FFmpeg 提取音频失败: {e.stderr}")
 
-    original_audio_segment = AudioSegment.from_wav(raw_audio_path)
-    processing_path = raw_audio_path # 默认使用原始音频
-
-    # --- 步骤 2: 对音频进行分块降噪，然后合并 ---
-    try:
-        from denoiser import pretrained
-        update_status_callback(stage="subtitle_denoise", details="正在加载 AI 降噪模型...")
-        denoiser_model = pretrained.dns64().cuda()
-        
-        denoised_full_audio = AudioSegment.silent(duration=0)
-        num_chunks_denoise = -(-len(original_audio_segment) // SUBTITLE_CHUNK_DURATION_MS)
-        denoise_temp_dir = temp_dir / "denoise_chunks"
-        denoise_temp_dir.mkdir(exist_ok=True)
-
-        for i in range(num_chunks_denoise):
-            start_ms = i * SUBTITLE_CHUNK_DURATION_MS
-            end_ms = min((i + 1) * SUBTITLE_CHUNK_DURATION_MS, len(original_audio_segment))
-            
-            update_status_callback(stage="subtitle_denoise", details=f"正在降噪音频块 {i+1}/{num_chunks_denoise}...")
-            
-            chunk_to_denoise = original_audio_segment[start_ms:end_ms]
-            chunk_path = denoise_temp_dir / f"chunk_{i}.wav"
-            chunk_to_denoise.export(chunk_path, format="wav")
-
-            try:
-                wav, sr = torchaudio.load(chunk_path)
-                wav = wav.cuda()
-                with torch.no_grad():
-                    denoised_wav = denoiser_model(wav[None])[0]
-                
-                denoised_chunk_path = denoise_temp_dir / f"denoised_chunk_{i}.wav"
-                torchaudio.save(denoised_chunk_path, denoised_wav.cpu(), 16000)
-                denoised_chunk_segment = AudioSegment.from_wav(denoised_chunk_path)
-                denoised_full_audio += denoised_chunk_segment
-            except Exception as chunk_e:
-                log_system_event("warning", f"降噪音频块 {i+1} 失败，将使用原始音频块。错误: {chunk_e}", in_worker=True)
-                denoised_full_audio += chunk_to_denoise
-
-        denoised_audio_path = temp_dir / "denoised_audio_full.wav"
-        denoised_full_audio.export(denoised_audio_path, format="wav")
-        processing_path = denoised_audio_path
-        log_system_event("info", "✅ 所有音频块降噪并合并成功。", in_worker=True)
-
-    except Exception as e:
-        log_system_event("warning", f"降噪流程整体失败，将使用原始音频进行VAD。错误: {e}", in_worker=True)
-
-    # --- 步骤 3: 对完整的（可能已降噪的）音频文件执行全局 VAD ---
+    # --- 步骤 2: 对完整的原始音频文件执行全局 VAD ---
     update_status_callback(stage="subtitle_vad", details="正在对完整音频进行VAD分析...")
     try:
         vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad',
                                       model='silero_vad', force_reload=False, onnx=True)
         
-        # 【核心修正】：恢复了所有关键的、经过调优的 VAD 参数
+        # 直接在最原始、最干净的音频上进行VAD
         global_speech_timestamps = get_speech_timestamps_silero(
-            str(processing_path),
+            str(raw_audio_path),
             vad_model,
             threshold=0.5,
             min_speech_duration_ms=250,
@@ -566,8 +637,9 @@ def preprocess_audio_for_subtitles(
         log_system_event("error", f"VAD处理失败: {e}", in_worker=True)
         raise RuntimeError(f"VAD处理失败: {e}")
 
-    # --- 步骤 4: 根据全局时间戳，从原始音频中精确切割 ---
+    # --- 步骤 3: 根据全局时间戳，从【同一份】原始音频中精确切割 ---
     update_status_callback(stage="subtitle_slicing", details="正在根据VAD结果进行音频切割...")
+    original_audio_segment = AudioSegment.from_wav(raw_audio_path)
     chunk_files = []
     chunks_dir = temp_dir / "audio_chunks"
     chunks_dir.mkdir(exist_ok=True)
@@ -576,9 +648,11 @@ def preprocess_audio_for_subtitles(
         start_ms = speech["start"]
         end_ms = speech["end"]
 
-        if end_ms <= start_ms: continue
+        # 最后的安全保障，虽然在新架构下几乎不可能触发
+        if end_ms <= start_ms: 
+            continue
 
-        # 从原始音频（未降噪）中切割，以保证最高音质
+        # 从原始音频中切割
         final_chunk = original_audio_segment[start_ms:end_ms]
         final_chunk_path = chunks_dir / f"chunk_{start_ms}.wav"
         final_chunk.export(str(final_chunk_path), format="wav")
@@ -589,7 +663,6 @@ def preprocess_audio_for_subtitles(
 
     log_system_event("info", f"音频分块处理完成，总共切分为 {len(chunk_files)} 个有效语音片段。", in_worker=True)
     return chunk_files
-
 
 # --- D. AI 交互与并发调度 ---
 
