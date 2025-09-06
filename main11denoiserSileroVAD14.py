@@ -479,14 +479,16 @@ def preprocess_audio_for_subtitles(
     update_status_callback: callable
 ) -> list[dict]:
     """
-    [最终正确版] 此版本彻底删除了所有“前置静音填充”和相关的时间戳修正逻辑，
-    并且在调用 VAD 函数时，使用了所有必要的、经过调优的参数。
+    [最终重构版] 此版本彻底废除了预先分块的错误架构。
+    它首先对整个音频进行 VAD 分析，得到一个完整的全局时间戳列表，
+    然后再根据这个列表进行精确切割。这从根本上解决了所有已知问题。
     """
     import torch
     import torchaudio
 
-    # 1. 直接提取原始音频，不再进行任何填充
-    update_status_callback(stage="subtitle_extract_audio", details="正在从视频中提取音频...")
+    # --- 步骤 1: 准备完整的音频文件 ---
+
+    update_status_callback(stage="subtitle_extract_audio", details="正在提取完整音频...")
     raw_audio_path = temp_dir / "raw_audio.wav"
     try:
         command = [
@@ -498,93 +500,77 @@ def preprocess_audio_for_subtitles(
         log_system_event("error", f"FFmpeg 提取音频失败。Stderr: {e.stderr}", in_worker=True)
         raise RuntimeError(f"FFmpeg 提取音频失败: {e.stderr}")
 
-    original_audio_segment = AudioSegment.from_wav(raw_audio_path)
+    processing_path = raw_audio_path
 
-    # 2. 加载 AI 降噪和 VAD 模型
-    denoiser_model = None
+    # --- 步骤 2 (可选): 尝试对完整音频进行降噪 ---
+
     try:
         from denoiser import pretrained
         update_status_callback(stage="subtitle_denoise", details="正在加载 AI 降噪模型...")
         denoiser_model = pretrained.dns64().cuda()
-        log_system_event("info", "AI 降噪模型加载成功。", in_worker=True)
+        
+        update_status_callback(stage="subtitle_denoise", details="正在对完整音频进行降噪 (可能需要较长时间)...")
+        wav, sr = torchaudio.load(raw_audio_path)
+        wav = wav.cuda()
+        with torch.no_grad():
+            denoised_wav = denoiser_model(wav[None])[0]
+        
+        denoised_audio_path = temp_dir / "denoised_audio.wav"
+        torchaudio.save(denoised_audio_path, denoised_wav.cpu(), 16000)
+        processing_path = denoised_audio_path
+        log_system_event("info", "✅ 完整音频降噪成功。", in_worker=True)
     except Exception as e:
-        log_system_event("warning", f"加载 AI 降噪模型失败，将跳过降噪步骤。错误: {e}", in_worker=True)
+        log_system_event("warning", f"完整音频降噪失败，将使用原始音频进行VAD。错误: {e}", in_worker=True)
 
+    # --- 步骤 3: 对完整的音频文件执行 VAD，获取全局时间戳 ---
+
+    update_status_callback(stage="subtitle_vad", details="正在对完整音频进行VAD分析...")
     try:
         vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad',
                                       model='silero_vad', force_reload=False, onnx=True)
+        
+        # 直接调用我们之前最终确定的、健壮的 VAD 函数
+        # 它会在内部加载完整的音频并返回所有时间戳
+        global_speech_timestamps = get_speech_timestamps_silero(
+            str(processing_path),
+            vad_model,
+            threshold=0.5,
+            min_speech_duration_ms=250,
+            min_silence_duration_ms=800,
+            speech_pad_ms=200
+        )
+        log_system_event("info", f"✅ VAD分析完成，共发现 {len(global_speech_timestamps)} 个潜在语音片段。", in_worker=True)
     except Exception as e:
-        log_system_event("error", f"加载 Silero VAD 模型失败: {e}", in_worker=True)
-        raise RuntimeError(f"无法加载 Silero VAD 模型: {e}")
+        log_system_event("error", f"VAD处理失败: {e}", in_worker=True)
+        raise RuntimeError(f"VAD处理失败: {e}")
 
-    # 3. 分块处理音频
-    update_status_callback(stage="subtitle_vad", details="正在进行音频分块与语音检测...")
-    total_duration_ms = len(original_audio_segment)
+    # --- 步骤 4: 根据全局时间戳，从原始音频中精确切割 ---
+    
+    update_status_callback(stage="subtitle_slicing", details="正在根据VAD结果进行音频切割...")
+    # 加载一次原始音频，用于最终的高质量切割
+    original_audio_segment = AudioSegment.from_wav(raw_audio_path)
     chunk_files = []
     chunks_dir = temp_dir / "audio_chunks"
     chunks_dir.mkdir(exist_ok=True)
-    num_chunks = -(-total_duration_ms // SUBTITLE_CHUNK_DURATION_MS)
 
-    for i in range(num_chunks):
-        start_time_ms = i * SUBTITLE_CHUNK_DURATION_MS
-        end_time_ms = min((i + 1) * SUBTITLE_CHUNK_DURATION_MS, total_duration_ms)
-        
-        log_system_event("info", f"正在处理音频总块 {i+1}/{num_chunks}...", in_worker=True)
-        
-        audio_chunk_segment = original_audio_segment[start_time_ms:end_time_ms]
-        temp_chunk_path = temp_dir / f"temp_chunk_{i}.wav"
-        audio_chunk_segment.export(temp_chunk_path, format="wav")
-        
-        processing_path = temp_chunk_path
-        
-        # 3.1 AI 降噪
-        if denoiser_model:
-            try:
-                wav, sr = torchaudio.load(temp_chunk_path)
-                wav = wav.cuda()
-                with torch.no_grad():
-                    denoised_wav = denoiser_model(wav[None])[0]
-                denoised_chunk_path = temp_dir / f"denoised_chunk_{i}.wav"
-                torchaudio.save(denoised_chunk_path, denoised_wav.cpu(), 16000)
-                processing_path = denoised_chunk_path
-            except Exception as e:
-                log_system_event("warning", f"当前块降噪失败，将使用原始音频。错误: {e}", in_worker=True)
-        
-        # 3.2 VAD 语音检测
-        try:
-            # 【核心修正】：恢复了所有关键的 VAD 调优参数
-            speech_timestamps = get_speech_timestamps_silero(
-                str(processing_path),
-                vad_model,
-                threshold=0.5,
-                min_speech_duration_ms=250,
-                min_silence_duration_ms=800,
-                speech_pad_ms=150
-            )
-            
-            # 3.3 根据 VAD 结果从原始音频中精确切片
-            for speech in speech_timestamps:
-                relative_start_ms = speech["start"]
-                relative_end_ms = speech["end"]
-                
-                absolute_start_ms = start_time_ms + relative_start_ms
-                absolute_end_ms = start_time_ms + relative_end_ms
-                
-                if absolute_end_ms <= absolute_start_ms:
-                    continue
+    for speech in global_speech_timestamps:
+        start_ms = speech["start"]
+        end_ms = speech["end"]
 
-                final_chunk = original_audio_segment[absolute_start_ms:absolute_end_ms]
-                final_chunk_path = chunks_dir / f"chunk_{absolute_start_ms}.wav"
-                final_chunk.export(str(final_chunk_path), format="wav")
-                
-                chunk_files.append({
-                    "path": str(final_chunk_path),
-                    "start_ms": absolute_start_ms,
-                    "end_ms": absolute_end_ms
-                })
-        except Exception as e:
-            log_system_event("error", f"当前块 VAD 处理失败: {e}", in_worker=True)
-    
+        # 最后的安全保障
+        if end_ms <= start_ms:
+            continue
+
+        final_chunk = original_audio_segment[start_ms:end_ms]
+        final_chunk_path = chunks_dir / f"chunk_{start_ms}.wav"
+        final_chunk.export(str(final_chunk_path), format="wav")
+        
+        chunk_files.append({
+            "path": str(final_chunk_path),
+            "start_ms": start_ms,
+            "end_ms": end_ms
+        })
+
     log_system_event("info", f"音频分块处理完成，总共切分为 {len(chunk_files)} 个有效语音片段。", in_worker=True)
     return chunk_files
 
