@@ -503,7 +503,7 @@ def preprocess_audio_for_subtitles(
         log_system_event("warning", "降噪模型不可用，将跳过降噪步骤。", in_worker=True)
     # <--- 修改结束 --->
 
-    
+
     # 3. 分块处理音频：降噪 -> VAD
     update_status_callback(stage="subtitle_vad", details="正在进行音频分块与语音检测...")
     original_audio = AudioSegment.from_wav(raw_audio_path)
@@ -982,7 +982,7 @@ def force_shutdown_endpoint():
 # --- 第 7 步: 高容错的统一任务处理器 (在子进程中运行) ---
 # =============================================================================
 
-def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue):
+def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, ai_models: dict):
     #
     # 处理一个完整的媒体任务，包含下载、字幕提取和上传等步骤。
     # 这个函数实现了方案2的核心逻辑：子任务的独立失败处理。
