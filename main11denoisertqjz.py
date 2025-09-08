@@ -400,24 +400,46 @@ class ProxyManager:
         self.best_node_speed = 0  # in MB/s
 
     def _download_xray(self):
-        """下载并解压 Xray 核心。"""
-        if self.v2ray_path.exists():
-            log_system_event("info", "Xray 核心已存在，跳过下载。")
+        """【依赖修复版】下载 Xray 核心的同时，也下载其路由所需的 geoip.dat 和 geosite.dat 文件。"""
+        geoip_path = Path("/kaggle/working/geoip.dat")
+        geosite_path = Path("/kaggle/working/geosite.dat")
+
+        # 检查核心和数据库文件是否都存在
+        if self.v2ray_path.exists() and geoip_path.exists() and geosite_path.exists():
+            log_system_event("info", "Xray 核心及数据库文件已存在，跳过下载。")
             return
         
-        log_system_event("info", "正在下载 Xray 核心...")
-        # 使用 Xray，因为它兼容 V2Ray 的所有协议且更新更频繁
-        url = "https://github.com/XTLS/Xray-core/releases/download/v1.8.10/Xray-linux-64.zip"
+        log_system_event("info", "正在下载 Xray 核心及数据库文件...")
+        
+        # 定义下载URL
+        xray_url = "https://github.com/XTLS/Xray-core/releases/download/v1.8.10/Xray-linux-64.zip"
+        geoip_url = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+        geosite_url = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+        
         zip_path = Path("/kaggle/working/xray.zip")
         
         try:
-            run_command(f"wget -q -O {zip_path} {url}").wait()
-            run_command(f"unzip -o {zip_path} xray -d /kaggle/working/").wait()
-            self.v2ray_path.chmod(0o755)
-            zip_path.unlink()
-            log_system_event("info", "✅ Xray 核心下载并解压成功。")
+            # 下载 Xray 核心
+            if not self.v2ray_path.exists():
+                log_system_event("info", "  -> 下载 Xray core...")
+                run_command(f"wget -q -O {zip_path} {xray_url}").wait()
+                run_command(f"unzip -o {zip_path} xray -d /kaggle/working/").wait()
+                self.v2ray_path.chmod(0o755)
+                zip_path.unlink()
+
+            # 下载 geoip.dat
+            if not geoip_path.exists():
+                log_system_event("info", "  -> 下载 geoip.dat...")
+                run_command(f"wget -q -O {geoip_path} {geoip_url}").wait()
+            
+            # 下载 geosite.dat
+            if not geosite_path.exists():
+                log_system_event("info", "  -> 下载 geosite.dat...")
+                run_command(f"wget -q -O {geosite_path} {geosite_url}").wait()
+
+            log_system_event("info", "✅ Xray 核心及数据库文件下载完成。")
         except Exception as e:
-            raise RuntimeError(f"下载 Xray 核心失败: {e}")
+            raise RuntimeError(f"下载 Xray 组件失败: {e}")
 
     def _fetch_and_parse_subscription(self):
         """获取并解析订阅链接，返回节点链接列表。"""
