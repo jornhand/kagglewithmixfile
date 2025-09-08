@@ -628,7 +628,7 @@ class ProxyManager:
         else:
             # 如果最优选择是直连，则返回 (None, None)
             return None, None
-            
+
 # =============================================================================
 # --- 第 4 步: 字幕提取核心模块 (在子进程中调用) ---
 # =============================================================================
@@ -722,61 +722,64 @@ def read_and_encode_file_base64(filepath: str) -> str | None:
 
 # --- C. 音频预处理管道 ---
 
-def preprocess_audio_for_subtitles(
+def extract_audio_with_ffmpeg(
     video_path: Path,
     temp_dir: Path,
-    update_status_callback: callable,
-    ai_models: dict  # <--- 修改：增加 ai_models 参数
-) -> list[dict]:
-    #
-    # 完整的音频预处理流程：提取 -> 降噪 -> VAD 切分。
-    #
-    # Args:
-    #     video_path (Path): 输入的视频文件路径。
-    #     temp_dir (Path): 用于存放所有中间文件的临时目录。
-    #     update_status_callback (callable): 用于更新任务状态的回调函数。
-    #
-    # Returns:
-    #     list[dict]: 一个包含所有有效语音片段信息的列表，
-    #                 每个元素是 {"path": str, "start_ms": int, "end_ms": int}。
-    # 
-    # Raises:
-    #     Exception: 如果在任何关键步骤（如 ffmpeg）中发生失败。
-    #
-    
-    # 1. 使用 ffmpeg 提取原始音频
-    update_status_callback(stage="subtitle_extract_audio", details="正在从视频中提取音频...")
+    update_status_callback: callable
+) -> Path:
+    """
+    【新增】只负责从视频中提取音频的函数。
+    这个过程会锁定视频文件，完成后即释放。
+    返回提取出的音频文件路径。
+    """
+    update_status_callback(stage="subtitle_extract_audio", details="正在从视频中提取音频 (ffmpeg)...")
     raw_audio_path = temp_dir / "raw_audio.wav"
     try:
         command = [
             "ffmpeg", "-i", str(video_path),
-            "-ac", "1", "-ar", "16000", # 单声道, 16kHz 采样率 (语音识别标准)
+            "-ac", "1", "-ar", "16000",
             "-vn", "-y", "-loglevel", "error", str(raw_audio_path)
         ]
-        # 使用 subprocess.run 等待命令完成
         process = subprocess.run(command, check=True, capture_output=True, text=True)
+        return raw_audio_path
     except subprocess.CalledProcessError as e:
         log_system_event("error", f"FFmpeg 提取音频失败。Stderr: {e.stderr}", in_worker=True)
         raise RuntimeError(f"FFmpeg 提取音频失败: {e.stderr}")
 
-    # 2. 尝试加载 AI 降噪模型
-    # 2. 获取预加载的 AI 降噪模型
+def preprocess_audio_for_subtitles(
+    raw_audio_path: Path, # <--- 输入参数变更
+    temp_dir: Path,
+    update_status_callback: callable,
+    ai_models: dict
+) -> list[dict]:
+    """
+    【修改后】接收一个已提取的音频文件，执行后续的降噪、VAD切分。
+    这个过程不再接触原始视频文件。
+    """
+    # 1. 检查降噪模型
     denoiser_model = ai_models.get("denoiser")
     if denoiser_model:
         update_status_callback(stage="subtitle_denoise", details="AI 降噪模型已加载，准备处理...")
         log_system_event("info", "将使用预加载的 AI 降噪模型。", in_worker=True)
     else:
         log_system_event("warning", "降噪模型不可用，将跳过降噪步骤。", in_worker=True)
-    # <--- 修改结束 --->
 
-
-    # 3. 分块处理音频：降噪 -> VAD
+    # 2. 分块处理音频：降噪 -> VAD
     update_status_callback(stage="subtitle_vad", details="正在进行音频分块与语音检测...")
-    original_audio = AudioSegment.from_wav(raw_audio_path)
+    try:
+        original_audio = AudioSegment.from_wav(raw_audio_path)
+    except Exception as e:
+        raise RuntimeError(f"无法加载提取出的音频文件 {raw_audio_path}: {e}")
+        
     total_duration_ms = len(original_audio)
     chunk_files = []
     chunks_dir = temp_dir / "audio_chunks"
     chunks_dir.mkdir(exist_ok=True)
+    
+    # 清理可能存在的旧音频块
+    for item in chunks_dir.iterdir():
+        item.unlink()
+
     num_chunks = -(-total_duration_ms // SUBTITLE_CHUNK_DURATION_MS)
 
     for i in range(num_chunks):
@@ -791,7 +794,7 @@ def preprocess_audio_for_subtitles(
         
         processing_path = temp_chunk_path
         
-        # 3.1 AI 降噪 (如果模型加载成功)
+        # 2.1 AI 降噪 (如果模型加载成功)
         if denoiser_model:
             try:
                 wav, sr = torchaudio.load(temp_chunk_path)
@@ -804,23 +807,17 @@ def preprocess_audio_for_subtitles(
             except Exception as e:
                 log_system_event("warning", f"当前块降噪失败，将使用原始音频。错误: {e}", in_worker=True)
         
-        # 3.2 VAD 语音检测
+        # 2.2 VAD 语音检测
         try:
             from faster_whisper.audio import decode_audio
             from faster_whisper.vad import VadOptions, get_speech_timestamps
             
-            vad_parameters = {
-                "threshold": 0.38, 
-                "min_speech_duration_ms": 150, 
-                "max_speech_duration_s": 15.0, # 稍微放宽以容纳长句
-                "min_silence_duration_ms": 1500, 
-                "speech_pad_ms": 500
-            }
+            vad_parameters = { "threshold": 0.38, "min_speech_duration_ms": 150, "max_speech_duration_s": 15.0, "min_silence_duration_ms": 1500, "speech_pad_ms": 500 }
             sampling_rate = 16000
             audio_data = decode_audio(str(processing_path), sampling_rate=sampling_rate)
             speech_timestamps = get_speech_timestamps(audio_data, vad_options=VadOptions(**vad_parameters))
             
-            # 3.3 根据 VAD 结果从原始音频中精确切片
+            # 2.3 根据 VAD 结果从原始音频中精确切片
             for speech in speech_timestamps:
                 relative_start_ms = int(speech["start"] / sampling_rate * 1000)
                 relative_end_ms = int(speech["end"] / sampling_rate * 1000)
@@ -830,11 +827,7 @@ def preprocess_audio_for_subtitles(
                 final_chunk = original_audio[absolute_start_ms:absolute_end_ms]
                 final_chunk_path = chunks_dir / f"chunk_{absolute_start_ms}.wav"
                 final_chunk.export(str(final_chunk_path), format="wav")
-                chunk_files.append({
-                    "path": str(final_chunk_path),
-                    "start_ms": absolute_start_ms,
-                    "end_ms": absolute_end_ms
-                })
+                chunk_files.append({ "path": str(final_chunk_path), "start_ms": absolute_start_ms, "end_ms": absolute_end_ms })
         except Exception as e:
             log_system_event("error", f"当前块 VAD 处理失败: {e}", in_worker=True)
     
@@ -1306,7 +1299,7 @@ def force_shutdown_endpoint():
 
 def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, upload_queue: multiprocessing.Queue, subtitle_config: dict, ai_models: dict):
     """
-    【最终修复版】修复了状态报告延迟问题，确保API状态与后台操作严格同步。
+    【并行优化最终版】将ffmpeg提取音频与后续处理拆分，实现视频上传与音频处理的最大化并行。
     """
     task_id = task_data['task_id']
     params = task_data['params']
@@ -1321,7 +1314,6 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
             "subtitle": {"status": "PENDING", "details": "准备中", "output": None, "error": None}
         }
     }
-
     def _update_status(component=None, status=None, details=None, progress_val=None, output=None, error_obj=None):
         payload = {'type': 'status_update', 'task_id': task_id, 'payload': {}}
         update_target = {}
@@ -1341,7 +1333,7 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
             payload['payload']['progress'] = _internal_status['progress']
         if payload['payload']:
              result_queue.put(payload)
-             
+
     try:
         # --- 步骤 1: 下载文件 ---
         _update_status(component="video", status="RUNNING", details="开始下载文件...", progress_val=5)
@@ -1349,7 +1341,6 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
         file_url = params['url']
         filename = unquote(file_url.split("/")[-1].split("?")[0] or f"file_{task_id}")
         local_file_path = temp_dir / filename
-
         with requests.get(file_url, stream=True, timeout=60) as r:
             r.raise_for_status()
             total_size = int(r.headers.get('content-length', 0))
@@ -1361,35 +1352,28 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
                     if total_size > 0:
                         dl_progress = round((bytes_downloaded / total_size) * 100)
                         _update_status(component="video", details=f"下载中 ({dl_progress}%)...", progress_val=5 + int(dl_progress * 0.2))
-        
-        # 【核心修改点 1】下载完成后，明确更新video状态
-        _update_status(component="video", details="下载完成，准备音频提取...")
+        _update_status(component="video", details="下载完成")
 
-
-        # --- 步骤 2: (如果需要) 串行执行有冲突的音频预处理 ---
-        audio_chunks = None
+        # --- 步骤 2: (如果需要) 串行执行冲突的 ffmpeg 音频提取 ---
+        raw_audio_path_for_subtitle = None
         if params["extract_subtitle"]:
             mime_type, _ = mimetypes.guess_type(local_file_path)
             if not (mime_type and mime_type.startswith("video")):
                 _update_status(component="subtitle", status="SKIPPED", details="源文件不是视频格式")
             else:
                 try:
-                    _update_status(component="subtitle", status="RUNNING", details="正在预处理音频...", progress_val=30)
                     def sub_progress_callback(stage, details): _update_status(component="subtitle", details=details)
-                    # 这个函数包含了ffmpeg调用和后续的VAD等步骤，它是阻塞的
-                    audio_chunks = preprocess_audio_for_subtitles(local_file_path, temp_dir, sub_progress_callback, ai_models)
+                    # 只执行第一步提取，完成后视频文件即被释放
+                    raw_audio_path_for_subtitle = extract_audio_with_ffmpeg(local_file_path, temp_dir, sub_progress_callback)
                 except Exception as e:
-                    log_system_event("error", f"音频预处理失败: {e}", in_worker=True)
-                    _update_status(component="subtitle", status="FAILED", details=f"音频预处理失败: {e}", error_obj={"code": "AUDIO_EXTRACTION_FAILED", "message": str(e)})
-                    audio_chunks = None
+                    _update_status(component="subtitle", status="FAILED", details=f"音频提取失败: {e}", error_obj={"code": "AUDIO_EXTRACTION_FAILED", "message": str(e)})
         else:
             _update_status(component="subtitle", status="SKIPPED", details="用户未请求提取")
 
-        # --- 步骤 3: 并行执行视频上传和字幕AI处理 ---
-        # 此时音频预处理已结束，视频文件已释放，可以安全地开始上传
+        # --- 步骤 3: 并行执行视频上传和后续音频处理 ---
+        # 此时 ffmpeg 已结束，视频文件已释放，可以安全地派发上传任务
         if params["upload_video"]:
-            # 【核心修改点 2】在派发任务前，立即更新状态
-            _update_status(component="video", status="RUNNING", details="已派发上传任务 (0%)...", progress_val=35)
+            _update_status(component="video", status="RUNNING", details="已派发上传任务", progress_val=35)
             upload_queue.put({
                 'task_id': task_id, 'component': 'video', 'local_file_path': str(local_file_path),
                 'filename_for_link': filename, 'api_client_base_url': task_data['api_client_base_url'],
@@ -1397,12 +1381,16 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
             })
         else:
             _update_status(component="video", status="SKIPPED", details="用户未请求上传")
-        
-        # 同时，如果音频块已成功提取，则开始进行耗时的AI处理
-        if audio_chunks is not None:
+
+        # 同时，如果第一步音频提取成功，则开始进行后续的、不冲突的音频处理和AI流程
+        if raw_audio_path_for_subtitle:
             try:
-                _update_status(component="subtitle", status="RUNNING", details="AI处理中...", progress_val=40)
                 def sub_progress_callback(stage, details): _update_status(component="subtitle", details=details)
+                # 第二步：处理已提取的音频
+                audio_chunks = preprocess_audio_for_subtitles(raw_audio_path_for_subtitle, temp_dir, sub_progress_callback, ai_models)
+                
+                # 第三步：AI字幕生成
+                _update_status(component="subtitle", status="RUNNING", details="AI处理中...", progress_val=40)
                 srt_content = run_subtitle_extraction_pipeline(subtitle_config, audio_chunks, sub_progress_callback)
                 
                 if not srt_content: raise RuntimeError("未能生成有效的字幕内容。")
@@ -1423,7 +1411,7 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
                 else:
                     _update_status(component="subtitle", status="SUCCESS", details="提取成功")
             except Exception as e:
-                _update_status(component="subtitle", status="FAILED", details=str(e), error_obj={"code": "TRANSCRIPTION_FAILED", "message": str(e)})
+                _update_status(component="subtitle", status="FAILED", details=str(e), error_obj={"code": "SUBTITLE_PIPELINE_FAILED", "message": str(e)})
 
         log_system_event("info", f"媒体处理进程为任务 {task_id} 的主要工作已完成。", in_worker=True)
 
@@ -1432,7 +1420,7 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
         result_queue.put({'type': 'task_result', 'task_id': task_id, 'status': 'FAILED', 'result': {}, 'error': {"code": "FATAL_ERROR", "message": str(e)}})
     finally:
         log_system_event("info", f"媒体处理进程 {task_id} 完成，不再清理主任务目录。", in_worker=True)
-
+        
 # =============================================================================
 # --- 第 8 步: 多进程 Worker 与主程序 ---
 # =============================================================================
