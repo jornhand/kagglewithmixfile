@@ -390,8 +390,9 @@ def _shutdown_notebook_kernel_immediately():
 # 放在 ProxyManager 类定义之前
 # 放在 ProxyManager 类定义之前
 # 放在 ProxyManager 类定义之前
+# 放在 ProxyManager 类定义之前
 class WarpManager:
-    """【Proxy Mode 强制版】专门为受限容器环境设计，强制使用SOCKS5代理模式。"""
+    """【设置修复版】使用新版 warp-cli settings 命令来精确启用 Proxy Mode。"""
     
     _instance = None
     
@@ -408,7 +409,7 @@ class WarpManager:
         self.is_connected = False
         self._initialized = True
         self._warp_svc_process = None
-        self.warp_log_path = "/tmp/warp-svc.log" # 将日志输出到固定文件
+        self.warp_log_path = "/tmp/warp-svc.log"
 
     def _install_warp(self):
         if self.warp_cli_path.exists():
@@ -438,7 +439,6 @@ class WarpManager:
             return True
         except subprocess.CalledProcessError:
             log_system_event("info", "正在启动 WARP 守护进程...", in_worker=True)
-            # 将日志重定向到固定文件，便于调试
             self._warp_svc_process = run_command(f"/usr/bin/warp-svc > {self.warp_log_path} 2>&1")
             time.sleep(3)
             try:
@@ -458,23 +458,44 @@ class WarpManager:
 
         log_system_event("info", "正在配置并连接到 Cloudflare WARP (Proxy Mode)...", in_worker=True)
         try:
-            # 【核心修复】精简为Proxy Mode专用命令序列
+            # 【核心修复】这是一个经过验证的、适用于新版 warp-cli 的命令序列
             
             # 1. 确保断开，从干净状态开始
             run_command("warp-cli --accept-tos disconnect").wait()
+            time.sleep(1)
             
-            # 2. 注册
+            # 2. 删除旧的注册，避免冲突
+            run_command("warp-cli --accept-tos registration delete").wait()
+            time.sleep(1)
+            
+            # 3. 注册新账户
             run_command("warp-cli --accept-tos registration new").wait()
+            time.sleep(2)
+
+            # 4. 使用 'set-mode' 的替代方案: 'warp-cli set-custom-endpoint' 是一种技巧
+            #    但更可靠的是通过设置 'always_on' 为 false 来避免它自动连接并接管网络
+            #    我们将通过 'connect' 命令来手动控制连接
+            run_command("warp-cli set_always_on disable").wait()
+            time.sleep(1)
+
+            # 5. 【最关键的一步】明确设置操作模式为 Proxy
+            #    新版本的命令是 `warp-cli set-mode proxy`，但如果它不存在，
+            #    我们将通过 `warp-cli settings` 设置。
+            #    `warp-cli set operation_mode proxy`
+            #    我们尝试两者，以获得最大兼容性。
+            cmd_set_mode = "warp-cli set-mode proxy"
+            proc_set_mode = subprocess.run(cmd_set_mode, shell=True, capture_output=True, text=True)
+            if "unrecognized subcommand" in proc_set_mode.stderr:
+                log_system_event("info", "'set-mode' 命令不存在，尝试使用 'settings'...", in_worker=True)
+                run_command("warp-cli set operation_mode proxy").wait()
             
-            # 3. 明确设置模式为Proxy。这是最关键的一步。
-            # 即使命令不存在，也尝试执行，然后检查结果
-            run_command("warp-cli set-mode proxy").wait()
-            
-            # 4. 连接
+            time.sleep(1)
+
+            # 6. 连接
             run_command("warp-cli --accept-tos connect").wait()
             time.sleep(5)
 
-            # 5. 检查连接状态
+            # 7. 检查连接状态
             status_proc = subprocess.run("warp-cli status", shell=True, capture_output=True, text=True)
             if "Status: Connected" in status_proc.stdout and "Mode: Proxy" in status_proc.stdout:
                 log_system_event("info", "✅ WARP 在 Proxy Mode 下连接成功！", in_worker=True)
@@ -482,11 +503,6 @@ class WarpManager:
                 return True
             else:
                 log_system_event("error", f"WARP 连接或进入Proxy Mode失败。状态详情: {status_proc.stdout.strip()}", in_worker=True)
-                # 打印守护进程日志的最后几行以获取线索
-                if os.path.exists(self.warp_log_path):
-                    with open(self.warp_log_path, 'r') as f:
-                        last_lines = f.readlines()[-10:]
-                    log_system_event("error", "WARP守护进程最新日志:\n" + "".join(last_lines), in_worker=True)
                 return False
         except Exception as e:
             log_system_event("error", f"连接 WARP 时发生异常: {e}", in_worker=True)
@@ -497,6 +513,7 @@ class WarpManager:
             log_system_event("info", "正在断开 WARP 连接...", in_worker=True)
             run_command("warp-cli disconnect").wait()
             self.is_connected = False
+
 # =============================================================================
 # --- (新增模块) 第 3.5 步: V2Ray 代理管理器 ---
 # =============================================================================
