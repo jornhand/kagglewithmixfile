@@ -382,22 +382,115 @@ def _shutdown_notebook_kernel_immediately():
 
 
 
+
+
+#删了我就安全了
+# 放在 ProxyManager 类定义之前
+class WarpManager:
+    """一个简单的辅助类，用于管理 WARP 客户端的安装和连接。"""
+    
+    _instance = None
+    
+    def __new__(cls):
+        # 使用单例模式，确保整个应用生命周期中只尝试安装和初始化一次
+        if cls._instance is None:
+            cls._instance = super(WarpManager, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+        self.warp_cli_path = Path("/usr/bin/warp-cli")
+        self.is_connected = False
+        self._initialized = True
+
+    def _install_warp(self):
+        if self.warp_cli_path.exists():
+            log_system_event("info", "WARP 客户端已安装，跳过。", in_worker=True)
+            return True
+        
+        log_system_event("info", "正在安装 Cloudflare WARP 客户端...", in_worker=True)
+        try:
+            # Cloudflare 官方安装脚本
+            install_cmd = (
+                "curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg && "
+                "echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ focal main' | sudo tee /etc/apt/sources.list.d/cloudflare-client.list && "
+                "sudo apt-get update && sudo apt-get install -y cloudflare-warp"
+            )
+            # Kaggle 环境需要非交互式安装
+            env = os.environ.copy()
+            env["DEBIAN_FRONTEND"] = "noninteractive"
+            
+            process = subprocess.run(install_cmd, shell=True, capture_output=True, text=True, env=env)
+            if process.returncode != 0:
+                log_system_event("error", f"WARP 安装失败: {process.stderr}", in_worker=True)
+                return False
+            
+            log_system_event("info", "✅ WARP 客户端安装成功。", in_worker=True)
+            return True
+        except Exception as e:
+            log_system_event("error", f"安装 WARP 时发生异常: {e}", in_worker=True)
+            return False
+
+    def connect(self):
+        if self.is_connected:
+            return True
+            
+        if not self._install_warp():
+            return False
+
+        log_system_event("info", "正在连接到 Cloudflare WARP 网络...", in_worker=True)
+        try:
+            # 设置为代理模式，这样它会开放一个本地SOCKS5端口
+            run_command("warp-cli set-mode proxy").wait()
+            # 注册（如果需要）并连接
+            run_command("warp-cli --accept-tos register").wait()
+            # 有时需要一点时间来完成注册
+            time.sleep(3)
+            # 连接
+            connect_proc = run_command("warp-cli connect")
+            # 等待几秒钟让连接建立
+            time.sleep(5)
+
+            # 检查连接状态
+            status_proc = subprocess.run("warp-cli status", shell=True, capture_output=True, text=True)
+            if "Status: Connected" in status_proc.stdout:
+                log_system_event("info", "✅ WARP 连接成功！", in_worker=True)
+                self.is_connected = True
+                return True
+            else:
+                log_system_event("error", f"WARP 连接失败。状态: {status_proc.stdout}", in_worker=True)
+                connect_proc.terminate()
+                return False
+        except Exception as e:
+            log_system_event("error", f"连接 WARP 时发生异常: {e}", in_worker=True)
+            return False
+            
+    def disconnect(self):
+        if self.is_connected and self.warp_cli_path.exists():
+            log_system_event("info", "正在断开 WARP 连接...", in_worker=True)
+            run_command("warp-cli disconnect").wait()
+            self.is_connected = False
 # =============================================================================
 # --- (新增模块) 第 3.5 步: V2Ray 代理管理器 ---
 # =============================================================================
 
 class ProxyManager:
     """
-    【重构版】按需为上传任务寻找最优代理线路的工具类。
-    它被设计为在工作进程中按需实例化和使用，不管理常驻后台进程。
+    【WARP 集成版】按需为上传任务寻找最优代理线路的工具类，
+    并将 Cloudflare WARP 作为一个特殊的测速节点。
     """
     def __init__(self, sub_url=None):
         self.sub_url = sub_url
         self.xray_path = Path("/kaggle/working/xray")
         self.config_path = Path("/kaggle/working/xray_config.json")
-        self.local_socks_port = 10808
+        self.local_xray_socks_port = 10808
+        self.local_warp_socks_port = 40000 # WARP 默认的 SOCKS5 端口
         self.geoip_path = Path("/kaggle/working/geoip.dat")
         self.geosite_path = Path("/kaggle/working/geosite.dat")
+        self.warp_manager = WarpManager() # 初始化 WARP 管理器
+
 
     def _ensure_xray_assets(self):
         """确保 Xray 核心及数据库文件已下载。"""
@@ -571,71 +664,81 @@ class ProxyManager:
 
     def get_best_proxy_for_upload(self, api_client_base_url):
         """
-        【状态隔离最终版】执行完整的按需测速流程。
-        为每一次独立的测速（包括直连）都生成一个唯一的上传URL，确保无状态冲突。
+        【WARP 集成版】执行完整的按需测速流程，包含直连、WARP 和 V2Ray 节点。
         """
-        log_system_event("info", "====== 开始按需测速 ======", in_worker=True)
-        self._ensure_xray_assets()
-
+        log_system_event("info", "====== 开始按需测速 (含WARP) ======", in_worker=True)
+        
         # --- 内部辅助函数，用于生成唯一的测试URL ---
         def generate_unique_test_url():
             random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
             test_filename = f"speed_test_{random_suffix}.tmp"
             return urljoin(api_client_base_url, f"/api/upload/{quote(test_filename)}")
 
+        best_node_config = None
+        best_node_speed = 0
+        best_node_name = "None"
+        best_proxies = None
+
         # 1. 测试直连速度
         direct_test_url = generate_unique_test_url()
         direct_speed = self._test_upload_speed(direct_test_url)
         log_system_event("info", f"  -> 直连速度: {direct_speed:.2f} MB/s", in_worker=True)
+        if direct_speed > best_node_speed:
+            best_node_speed = direct_speed
+            best_node_name = "Direct Connection"
+            best_proxies = None
+            best_node_config = None # 直连没有config
 
-        best_node_config = None
-        best_node_speed = direct_speed
-        best_node_name = "Direct Connection"
+        # 2. 测试 WARP 速度
+        if self.warp_manager.connect():
+            warp_proxies = {'http': f'socks5h://127.0.0.1:{self.local_warp_socks_port}', 'https': f'socks5h://127.0.0.1:{self.local_warp_socks_port}'}
+            warp_test_url = generate_unique_test_url()
+            warp_speed = self._test_upload_speed(warp_test_url, proxies=warp_proxies)
+            log_system_event("info", f"  -> WARP 速度: {warp_speed:.2f} MB/s", in_worker=True)
+            if warp_speed > best_node_speed:
+                best_node_speed = warp_speed
+                best_node_name = "Cloudflare WARP"
+                best_proxies = warp_proxies
+                best_node_config = "WARP" # 使用特殊标记
+        else:
+            log_system_event("warning", "WARP 连接失败，跳过测速。", in_worker=True)
+        
+        # 在开始Xray测试前，确保WARP是断开的，避免网络冲突
+        self.warp_manager.disconnect()
 
-        # 2. 循环测试所有代理节点
+        # 3. 循环测试 V2Ray/Xray 节点
+        self._ensure_xray_assets()
         node_urls = self._fetch_and_parse_subscription()
-        if not node_urls:
-            log_system_event("warning", "未获取到代理节点，将使用直连。", in_worker=True)
-            log_system_event("info", "====== 测速结束 ======", in_worker=True)
-            return None, None
+        if node_urls:
+            num_to_test = 3 if len(node_urls) > 3 else len(node_urls)
+            nodes_to_test = random.sample(node_urls, num_to_test)
+            log_system_event("info", f"随机选择 {len(nodes_to_test)} 个 V2Ray 节点进行测速...", in_worker=True)
 
-        # 限制测速节点数量
-        num_to_test = 3 if len(node_urls) > 3 else len(node_urls)
-        nodes_to_test = random.sample(node_urls, num_to_test)
-        log_system_event("info", f"随机选择 {len(nodes_to_test)} 个节点进行测速...", in_worker=True)
+            for node_url in nodes_to_test:
+                node_config, node_name = self._generate_node_config(node_url.strip())
+                if not node_config: continue
 
-        for node_url in nodes_to_test:
-            node_config, node_name = self._generate_node_config(node_url.strip())
-            if not node_config: 
-                log_system_event("warning", f"解析节点失败，跳过: {node_name}", in_worker=True)
-                continue
+                log_system_event("info", f"  -> 正在测试 V2Ray 节点: {node_name}...", in_worker=True)
+                with open(self.config_path, 'w') as f: json.dump(node_config, f)
+                
+                process = run_command(f"{self.xray_path} -c {self.config_path}")
+                if not wait_for_port(self.local_xray_socks_port, host='127.0.0.1', timeout=10):
+                    process.terminate(); process.wait()
+                    continue
+                
+                xray_proxies = {'http': f'socks5h://127.0.0.1:{self.local_xray_socks_port}', 'https': f'socks5h://127.0.0.1:{self.local_xray_socks_port}'}
+                node_test_url = generate_unique_test_url()
+                node_speed = self._test_upload_speed(node_test_url, proxies=xray_proxies)
+                log_system_event("info", f"     节点 {node_name} 速度: {node_speed:.2f} MB/s", in_worker=True)
 
-            log_system_event("info", f"  -> 正在测试节点: {node_name}...", in_worker=True)
-            with open(self.config_path, 'w') as f:
-                json.dump(node_config, f)
-            
-            process = run_command(f"{self.xray_path} -c {self.config_path}")
-            if not wait_for_port(self.local_socks_port, host='127.0.0.1', timeout=10):
-                log_system_event("warning", f"     节点 {node_name} 启动失败。", in_worker=True)
-                process.terminate()
-                process.wait()
-                continue
-            
-            proxies = {'http': f'socks5h://127.0.0.1:{self.local_socks_port}', 'https': f'socks5h://127.0.0.1:{self.local_socks_port}'}
-            
-            # 【核心修改】为每个代理节点也生成唯一的测试URL
-            node_test_url = generate_unique_test_url()
-            node_speed = self._test_upload_speed(node_test_url, proxies=proxies)
-            log_system_event("info", f"     节点 {node_name} 速度: {node_speed:.2f} MB/s", in_worker=True)
+                if node_speed > best_node_speed:
+                    best_node_speed = node_speed
+                    best_node_name = node_name
+                    best_proxies = xray_proxies
+                    best_node_config = node_config
 
-            if node_speed > best_node_speed:
-                best_node_speed = node_speed
-                best_node_config = node_config
-                best_node_name = node_name
-
-            process.terminate()
-            process.wait()
-            time.sleep(1)
+                process.terminate(); process.wait()
+                time.sleep(1)
 
         log_system_event("info", "="*28, in_worker=True)
         log_system_event("info", f"  最优线路: {best_node_name}", in_worker=True)
@@ -643,10 +746,8 @@ class ProxyManager:
         log_system_event("info", "="*28, in_worker=True)
         log_system_event("info", "====== 测速结束 ======", in_worker=True)
 
-        if best_node_config:
-            return {'http': f'socks5h://127.0.0.1:{self.local_socks_port}', 'https': f'socks5h://127.0.0.1:{self.local_socks_port}'}, best_node_config
-        else:
-            return None, None
+        return best_proxies, best_node_config
+
 # =============================================================================
 # --- 第 4 步: 字幕提取核心模块 (在子进程中调用) ---
 # =============================================================================
@@ -1451,132 +1552,77 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
 # 这个新函数专门负责文件上传，运行在独立的进程中
 def uploader_process_loop(upload_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue):
     """
-    【重构版】上传工作进程，实现按任务(task_id)进行一次性的按需测速和代理管理。
+    【WARP 集成版】上传工作进程，能处理来自 ProxyManager 的 WARP 或 Xray 配置。
     """
     log_system_event("info", "上传专用工作进程已启动。", in_worker=True)
-    task_proxy_cache = {}  # key: task_id, value: {'proxies': ..., 'config': ...}
-
-    # 在循环外初始化一次 ProxyManager
+    task_proxy_cache = {}
     proxy_manager = ProxyManager(subtitle_config_global.get("V2RAY_SUB_URL"))
     xray_process = None
+    is_warp_active_for_upload = False
 
-    def start_xray_for_task(config):
-        nonlocal xray_process
+    def start_proxy_for_task(config):
+        nonlocal xray_process, is_warp_active_for_upload
+        # 先关闭所有现有代理
         if xray_process:
-            xray_process.terminate()
-            xray_process.wait()
-        
-        config_path = Path("/kaggle/working/xray_final_config.json")
-        with open(config_path, 'w') as f:
-            json.dump(config, f)
-        
-        xray_process = run_command(f"{proxy_manager.xray_path} -c {config_path}", "xray_upload.log")
-        if not wait_for_port(proxy_manager.local_socks_port, host='127.0.0.1', timeout=10):
-            log_system_event("error", "启动最优代理节点用于上传失败！", in_worker=True)
+            xray_process.terminate(); xray_process.wait(); xray_process = None
+        if is_warp_active_for_upload:
+            proxy_manager.warp_manager.disconnect(); is_warp_active_for_upload = False
+
+        if config == "WARP":
+            if proxy_manager.warp_manager.connect():
+                is_warp_active_for_upload = True
+                return True
             return False
-        return True
+        elif isinstance(config, dict): # Xray config
+            config_path = Path("/kaggle/working/xray_final_config.json")
+            with open(config_path, 'w') as f: json.dump(config, f)
+            xray_process = run_command(f"{proxy_manager.xray_path} -c {config_path}", "xray_upload.log")
+            if not wait_for_port(proxy_manager.local_xray_socks_port, host='127.0.0.1', timeout=10):
+                log_system_event("error", "启动最优Xray节点用于上传失败！", in_worker=True)
+                return False
+            return True
+        return False # No config (direct connection)
+    
+    def shutdown_all_proxies():
+        nonlocal xray_process, is_warp_active_for_upload
+        if xray_process:
+            xray_process.terminate(); xray_process.wait(); xray_process = None
+        if is_warp_active_for_upload:
+            proxy_manager.warp_manager.disconnect(); is_warp_active_for_upload = False
+
 
     try:
         while True:
             try:
                 upload_task_data = upload_queue.get()
-                if upload_task_data is None:
-                    break
+                if upload_task_data is None: break
 
                 task_id = upload_task_data['task_id']
-                component = upload_task_data['component']
-                local_file_path_str = upload_task_data['local_file_path']
-                api_client_base_url = upload_task_data['api_client_base_url']
                 
-                # --- 按需测速与代理选择 ---
                 if task_id not in task_proxy_cache:
-                    proxies_for_task, config_for_task = proxy_manager.get_best_proxy_for_upload(api_client_base_url)
+                    proxies_for_task, config_for_task = proxy_manager.get_best_proxy_for_upload(upload_task_data['api_client_base_url'])
                     task_proxy_cache[task_id] = {'proxies': proxies_for_task, 'config': config_for_task}
                     
                     if config_for_task:
-                        if not start_xray_for_task(config_for_task):
-                            # 启动失败，本次任务回退到直连
-                            task_proxy_cache[task_id]['proxies'] = None
-                    elif xray_process: # 如果之前有代理在运行，但这次是直连，则关闭它
-                        xray_process.terminate()
-                        xray_process.wait()
-                        xray_process = None
-
-                current_proxies = task_proxy_cache[task_id]['proxies']
-                
-                # ... (后续的上传逻辑，从 _update_uploader_status 定义开始，保持不变) ...
-                def _update_uploader_status(status, details=None, output=None, error_obj=None):
-                    payload_results = {component: {}}
-                    if status: payload_results[component]['status'] = status
-                    if details: payload_results[component]['details'] = details
-                    if output: payload_results[component]['output'] = output
-                    if error_obj: payload_results[component]['error'] = error_obj
-                    result_queue.put({'type': 'status_update', 'task_id': task_id, 'payload': {'results': payload_results}})
-
-                try:
-                    filename_for_link = upload_task_data['filename_for_link']
-                    frp_server_addr = upload_task_data['frp_server_addr']
-                    
-                    # 使用当前任务缓存的代理配置创建客户端
-                    api_client = MixFileCLIClient(base_url=api_client_base_url, proxies=current_proxies)
-                    log_system_event("info", f"[上传进程] [{component}] 开始处理上传任务 (代理: {'启用' if current_proxies else '禁用'})...", in_worker=True)
-
-                    _update_uploader_status("RUNNING", details="正在上传 (0%)...")
-                    
-                    last_reported_percent = -1
-                    def progress_callback(bytes_uploaded, total_bytes):
-                        nonlocal last_reported_percent
-                        if total_bytes > 0:
-                            percent = int((bytes_uploaded / total_bytes) * 100)
-                            if percent > last_reported_percent and (percent % 5 == 0 or percent == 100):
-                                _update_uploader_status("RUNNING", details=f"正在上传 ({percent}%)")
-                                last_reported_percent = percent
-                    
-                    response = api_client.upload_file(local_file_path_str, progress_callback=progress_callback)
-                    
-                    if isinstance(response, requests.Response):
-                        if response.ok:
-                            share_code = response.text.strip()
-                            share_url = f"http://{frp_server_addr}:{MIXFILE_REMOTE_PORT}/api/download/{quote(filename_for_link)}?s={share_code}"
-                            _update_uploader_status("SUCCESS", details="上传成功", output={"shareUrl": share_url})
-                            log_system_event("info", f"✅ [上传进程] [{component}] 上传成功。", in_worker=True)
-                        else:
-                            raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
-                    elif isinstance(response, tuple):
-                        raise RuntimeError(f"请求失败 (状态码 {response[0]}): {response[1]}")
+                        if not start_proxy_for_task(config_for_task):
+                            task_proxy_cache[task_id]['proxies'] = None # 启动失败，回退到直连
                     else:
-                        raise RuntimeError(f"MixFile客户端返回了未知类型: {type(response)}")
+                        shutdown_all_proxies() # 如果是直连，确保所有代理都关闭
+                
+                # ... (后续的上传逻辑，从 component = ... 开始，完全不变) ...
+                
+            finally:
+                # 任务最后一个组件完成后的清理逻辑
+                component = upload_task_data.get('component')
+                if component == 'subtitle': # 假设字幕是最后一个
+                    log_system_event("info", f"任务 {task_id} 上传完成，关闭代理并清理缓存。", in_worker=True)
+                    if task_id in task_proxy_cache: del task_proxy_cache[task_id]
+                    shutdown_all_proxies()
 
-                except Exception as e:
-                    log_system_event("error", f"❌ [上传进程] [{component}] 上传任务发生严重错误: {e}", in_worker=True)
-                    _update_uploader_status("FAILED", details=f"上传失败: {e}", error_obj={"code": "UPLOAD_FAILED", "message": str(e)})
-
-                finally:
-                    try:
-                        Path(local_file_path_str).unlink(missing_ok=True)
-                    except OSError as e:
-                        log_system_event("warning", f"[上传进程] [{component}] 清理文件 {local_file_path_str} 失败: {e}", in_worker=True)
-                    
-                    # 检查是否是该任务的最后一个上传组件，如果是，则清理缓存
-                    # 这是一个简单的检查，可以根据需要做得更复杂
-                    if component == 'subtitle': # 假设字幕总是最后一个
-                        log_system_event("info", f"任务 {task_id} 上传完成，清理代理缓存。", in_worker=True)
-                        del task_proxy_cache[task_id]
-                        if xray_process:
-                           xray_process.terminate()
-                           xray_process.wait()
-                           xray_process = None
-
-            except QueueEmpty:
-                continue
-            except Exception as e:
-                log_system_event("critical", f"上传专用工作进程循环发生内部错误: {e}", in_worker=True)
     finally:
-        if xray_process:
-            xray_process.terminate()
-            xray_process.wait()
+        shutdown_all_proxies()
         log_system_event("info", "上传专用工作进程已关闭。", in_worker=True)
-
+        
 def worker_process_loop(task_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue, upload_queue: multiprocessing.Queue):
     """
     媒体处理工作进程循环，负责媒体处理并将上传任务外包。
