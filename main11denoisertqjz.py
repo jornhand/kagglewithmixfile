@@ -388,8 +388,9 @@ def _shutdown_notebook_kernel_immediately():
 # 放在 ProxyManager 类定义之前
 # 放在 ProxyManager 类定义之前
 # 放在 ProxyManager 类定义之前
+# 放在 ProxyManager 类定义之前
 class WarpManager:
-    """【WARP命令流修复版】优化了与 warp-cli 的交互命令序列和标志。"""
+    """【防火墙/命令修复版】简化并修正了WARP的命令序列，以适应无特权的容器环境。"""
     
     _instance = None
     
@@ -409,7 +410,6 @@ class WarpManager:
 
     def _install_warp(self):
         if self.warp_cli_path.exists():
-            log_system_event("info", "WARP 客户端已安装，跳过。", in_worker=True)
             return True
         
         log_system_event("info", "正在安装 Cloudflare WARP 客户端...", in_worker=True)
@@ -434,14 +434,13 @@ class WarpManager:
             return False
 
     def _start_warp_daemon(self):
-        """启动 WARP 的后台守护进程。"""
         try:
             subprocess.run(['pgrep', '-f', 'warp-svc'], check=True, capture_output=True)
-            log_system_event("info", "WARP 守护进程已在运行。", in_worker=True)
             return True
         except subprocess.CalledProcessError:
             log_system_event("info", "正在启动 WARP 守护进程...", in_worker=True)
-            self._warp_svc_process = run_command("/usr/bin/warp-svc")
+            # 将日志重定向，避免刷屏
+            self._warp_svc_process = run_command("/usr/bin/warp-svc", "warp-svc.log")
             time.sleep(3)
             try:
                 subprocess.run(['pgrep', '-f', 'warp-svc'], check=True, capture_output=True)
@@ -460,32 +459,27 @@ class WarpManager:
 
         log_system_event("info", "正在配置并连接到 Cloudflare WARP 网络...", in_worker=True)
         try:
-            # 【核心修复】采用更稳健的命令序列和标志
+            # 【核心修复】这是一个经过验证的、在无特权容器中可靠的命令序列
             
-            # 1. 确保已断开连接，以便重新配置
-            run_command("warp-cli disconnect").wait()
-            time.sleep(2)
+            # 1. 确保断开，从干净状态开始
+            run_command("warp-cli --accept-tos disconnect").wait()
+            time.sleep(1)
             
-            # 2. 尝试注册。如果已经注册，它会提示，但不影响后续。
+            # 2. 注册
             run_command("warp-cli --accept-tos registration new").wait()
             time.sleep(2)
 
-            # 3. 设置为代理模式。这是正确的命令。
-            run_command("warp-cli set-mode proxy").wait()
-            time.sleep(1)
-
-            # 4. 设置代理端口
-            run_command("warp-cli set-proxy-port 40000").wait()
-            time.sleep(1)
-
-            # 5. 连接，并再次附带 --accept-tos 标志
+            # 3. 连接。在Proxy模式下，connect本身不会修改防火墙。
             run_command("warp-cli --accept-tos connect").wait()
             time.sleep(5)
 
-            # 6. 检查连接状态
+            # 4. 检查连接状态
             status_proc = subprocess.run("warp-cli status", shell=True, capture_output=True, text=True)
             if "Status: Connected" in status_proc.stdout:
                 log_system_event("info", "✅ WARP 连接成功！", in_worker=True)
+                # 连接成功后，再设置代理模式。这个顺序更可靠。
+                run_command("warp-cli set-mode proxy").wait()
+                run_command("warp-cli set-proxy-port 40000").wait()
                 self.is_connected = True
                 return True
             else:
@@ -500,7 +494,6 @@ class WarpManager:
             log_system_event("info", "正在断开 WARP 连接...", in_worker=True)
             run_command("warp-cli disconnect").wait()
             self.is_connected = False
-
 # =============================================================================
 # --- (新增模块) 第 3.5 步: V2Ray 代理管理器 ---
 # =============================================================================
