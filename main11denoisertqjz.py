@@ -44,6 +44,22 @@ from queue import Empty as QueueEmpty
 from flask import Flask, request, jsonify, Response
 import requests
 
+
+
+
+
+# =============================================================================
+# --- (新增模块) 第 3.5 步: V2Ray 代理管理器 ---
+# =============================================================================
+import base64
+import json
+import random
+import string
+from urllib.parse import urlparse, parse_qs
+
+
+
+
 # --- 加密与密钥管理 ---
 # 尝试导入关键库，如果失败则在后续检查中处理
 try:
@@ -89,10 +105,10 @@ history: "history.mix_list"
 # !!! 重要 !!!
 # 在这里粘贴你从 encrypt_util.py 工具中获得的加密配置字符串
 # 第一个字符串用于 FRP (反向代理)
-ENCRYPTED_FRP_CONFIG = "gAAAAABovlq5eZqm14o0ddUxmCreB0eC7I37GuGnMHN9cqo48tI2j9F9IRERWtCjFcLFC9i1tRZIgzy8mGdf4rQv50Tj6a-VUVUCJJOtTZXHy0FlogmtYZYmiTniw6P_Kor2CmApOnDIa6qfFG8MdbLk9yawSuaJbo3WqAdg4XZiTaE-ZhSEOaurM5JlDaJzP7rhpcj4Pfn0"
+ENCRYPTED_FRP_CONFIG = "gAAAAABovqeXe55F4-o0c7vo8hIdPtcdQGWGAZganedI9sUqYQeyzDCzCxLLIjFLpCtTJQGedUh17nzhWhjgNEooN9ybgSYPnoHCSgKsGo64m0ghmUxPhbxrsocys4zki5IAMpuah_NrOH5YX4r-rQnKCI_S2yfurJp2E-eB_ciXodI8-X002KsMIK1ZpbvmVbH5I88bxV5V"
 
 # 第二个字符串用于字幕服务 (Gemini API 密钥等)
-ENCRYPTED_SUBTITLE_CONFIG = "gAAAAABovlsJ8w_bXjsCly9Ym9s5aDR1aN3h_nCg-Y2QK1Xqoy2FQt-c5kG6V7KXjMQucAp_uTKn176QjE7XGLtgI1bQ83RxUsjSN_OnBesJIcpDulrd25onALcLs6ZKXTdwu53l5yPd5ckqgEsqNjV6v4hTWwF44BaqtdKkaryAZWFzWvYgUac403CjiLUbFVsHhAaXairmahpOMOjj-3US2OSPesWbcIxznBkrZ71D_VVSozI411UukNtDSoosKskK2XtZqrT0JTxwuq_SA4HmewD20nKyqUkD1z6AyS8JahgDHdaYPdmCty6aGrlYSA__HRUjVAJsnfzK2Gkah_6gnIRfBUfM0eTa_cuQ514yUiiMJvk9ZGOvbPTGbCHcioS5Zd70ByCy" # 示例，请替换
+ENCRYPTED_SUBTITLE_CONFIG = "gAAAAABovqfhTA9gwxUiOPivABQMk3PXitnzjVdCzOVTu9T1RcE7KSRQWHWqVn3geXJ--yA7IqD8Y3JIIG3X-zUA0j6xMwD9jOhysygys84C1pmm4LyqCg2FqEn-V6UitUxKzbOeXEMDPXVjSS_gP97-k6Dtmp38qSMp91v3BxNp94iJvcRNfDH4DbfZm4rrRwamVFeJzRiFGzPe35bwUqBXhUrIngQweiR1VTvtSnk0tnP53AfRdRPfuK9DSluhfASBrXQnt8bf9KtN0uzuc02SGMGtjFDt_nwxjfE2UEeC6nbQZ6peGDRbfQMFvEu8owsaWnaQdFe-YV7S4xjCjmmj9xw-2NnaFnplP3hYmPfLtE3EuvXXsQ4x30cnkwba0z_0-BEh0pXx-1kaR70T-uaDq5SHfAFbabIALekIRtaUX6EscuWxjU6MPP4S8Ld41kiub5mLVx5YzB3MAK7lMfC6gbtRQY9RWM-LZq739fXbf2U30W5M0R2ZDGsQNfAKcHoqfIQNPJBo" # 示例，请替换
 
 # -- C. 本地服务与端口配置 --
 MIXFILE_LOCAL_PORT = 4719
@@ -363,6 +379,204 @@ def _shutdown_notebook_kernel_immediately():
     
     # SIGKILL (信号 9) 是一个无法被捕获或忽略的信号，比 os._exit 更为强制。
     os.kill(os.getpid(), signal.SIGKILL)
+
+
+
+# =============================================================================
+# --- (新增模块) 第 3.5 步: V2Ray 代理管理器 ---
+# =============================================================================
+
+class ProxyManager:
+    """
+    负责下载、测试和管理 V2Ray/Xray 代理客户端，以加速文件上传。
+    """
+    def __init__(self, sub_url, mixfile_base_url):
+        self.sub_url = sub_url
+        self.mixfile_base_url = mixfile_base_url
+        self.v2ray_path = Path("/kaggle/working/xray")
+        self.config_path = Path("/kaggle/working/xray_config.json")
+        self.local_socks_port = 10808
+        self.best_node_config = None
+        self.best_node_speed = 0  # in MB/s
+
+    def _download_xray(self):
+        """下载并解压 Xray 核心。"""
+        if self.v2ray_path.exists():
+            log_system_event("info", "Xray 核心已存在，跳过下载。")
+            return
+        
+        log_system_event("info", "正在下载 Xray 核心...")
+        # 使用 Xray，因为它兼容 V2Ray 的所有协议且更新更频繁
+        url = "https://github.com/XTLS/Xray-core/releases/download/v1.8.10/Xray-linux-64.zip"
+        zip_path = Path("/kaggle/working/xray.zip")
+        
+        try:
+            run_command(f"wget -q -O {zip_path} {url}").wait()
+            run_command(f"unzip -o {zip_path} xray -d /kaggle/working/").wait()
+            self.v2ray_path.chmod(0o755)
+            zip_path.unlink()
+            log_system_event("info", "✅ Xray 核心下载并解压成功。")
+        except Exception as e:
+            raise RuntimeError(f"下载 Xray 核心失败: {e}")
+
+    def _fetch_and_parse_subscription(self):
+        """获取并解析订阅链接，返回节点链接列表。"""
+        log_system_event("info", f"正在从 {self.sub_url[:30]}... 获取订阅...")
+        try:
+            response = requests.get(self.sub_url, timeout=20)
+            response.raise_for_status()
+            decoded_content = base64.b64decode(response.content).decode('utf-8')
+            return decoded_content.strip().split('\n')
+        except Exception as e:
+            log_system_event("error", f"获取或解析订阅失败: {e}")
+            return []
+
+    def _generate_node_config(self, node_url):
+        """根据节点URL生成Xray的JSON配置。"""
+        try:
+            # 基础配置模板
+            config = {
+                "log": {"loglevel": "warning"},
+                "inbounds": [{
+                    "port": self.local_socks_port,
+                    "protocol": "socks",
+                    "listen": "127.0.0.1",
+                    "settings": {"auth": "noauth", "udp": True}
+                }],
+                "outbounds": [{"protocol": "freedom", "settings": {}}]
+            }
+            
+            parsed_url = urlparse(node_url)
+            protocol = parsed_url.scheme
+            
+            outbound = {"protocol": protocol, "settings": {}}
+            
+            if protocol == "vmess":
+                decoded_vmess = json.loads(base64.b64decode(parsed_url.netloc).decode('utf-8'))
+                outbound["settings"]["vnext"] = [{
+                    "address": decoded_vmess["add"],
+                    "port": int(decoded_vmess["port"]),
+                    "users": [{"id": decoded_vmess["id"], "alterId": int(decoded_vmess["aid"]), "security": decoded_vmess.get("scy", "auto")}]
+                }]
+                stream_settings = {"network": decoded_vmess.get("net", "tcp")}
+                if stream_settings["network"] == "ws":
+                    stream_settings["wsSettings"] = {"path": decoded_vmess.get("path", "/")}
+                if decoded_vmess.get("tls", "") == "tls":
+                     stream_settings["security"] = "tls"
+                     stream_settings["tlsSettings"] = {"serverName": decoded_vmess.get("host", decoded_vmess["add"])}
+                outbound["streamSettings"] = stream_settings
+
+            elif protocol == "vless":
+                qs = parse_qs(parsed_url.query)
+                outbound["settings"]["vnext"] = [{
+                    "address": parsed_url.hostname,
+                    "port": parsed_url.port,
+                    "users": [{"id": parsed_url.username, "flow": qs.get("flow", [None])[0]}]
+                }]
+                stream_settings = {"network": qs.get("type", ["tcp"])[0]}
+                if stream_settings["network"] == "ws":
+                    stream_settings["wsSettings"] = {"path": qs.get("path", ["/"])[0]}
+                if qs.get("security", ["none"])[0] == "tls":
+                    stream_settings["security"] = "tls"
+                    stream_settings["tlsSettings"] = {"serverName": qs.get("sni", [parsed_url.hostname])[0]}
+                outbound["streamSettings"] = stream_settings
+
+            else:
+                return None, "Unsupported"
+
+            config["outbounds"][0] = outbound
+            return config, parsed_url.fragment or parsed_url.hostname # Node name
+        except Exception as e:
+            return None, str(e)
+
+    def _test_node_upload_speed(self, node_config, node_name):
+        """启动节点并测试其上传速度，返回MB/s。"""
+        log_system_event("info", f"  -> 正在测试节点: {node_name}...")
+        with open(self.config_path, 'w') as f:
+            json.dump(node_config, f)
+        
+        process = run_command(f"{self.v2ray_path} -c {self.config_path}")
+        if not wait_for_port(self.local_socks_port, timeout=10):
+            log_system_event("warning", f"     节点 {node_name} 启动失败。")
+            process.terminate()
+            process.wait()
+            return 0
+
+        speed = 0
+        try:
+            proxies = {
+                'http': f'socks5h://127.0.0.1:{self.local_socks_port}',
+                'https': f'socks5h://127.0.0.1:{self.local_socks_port}',
+            }
+            # 创建一个 2MB 的随机文件用于测试
+            test_data_size = 5 * 1024 * 1024
+            test_data = ''.join(random.choices(string.ascii_letters + string.digits, k=test_data_size)).encode()
+            
+            test_upload_url = urljoin(self.mixfile_base_url, "/api/upload/proxy_test.tmp")
+            
+            start_time = time.time()
+            # 注意：这里的测试目标是MixFile服务，确保测试的是真实上传链路
+            response = requests.put(test_upload_url, data=test_data, proxies=proxies, timeout=60)
+            end_time = time.time()
+            
+            response.raise_for_status()
+            
+            duration = end_time - start_time
+            speed = (test_data_size / duration) / (1024 * 1024) # MB/s
+            log_system_event("info", f"     ✅ 节点 {node_name} 可用，上传速度: {speed:.2f} MB/s")
+        except Exception as e:
+            log_system_event("warning", f"     ❌ 节点 {node_name} 测试失败: {e}")
+        finally:
+            process.terminate()
+            process.wait()
+            time.sleep(1) # 确保端口已释放
+        return speed
+
+    def setup_best_proxy(self):
+        """主流程：寻找并启动最快的代理节点。"""
+        global GLOBAL_PROXY_SETTINGS
+        try:
+            self._download_xray()
+            node_urls = self._fetch_and_parse_subscription()
+            if not node_urls:
+                log_system_event("warning", "未获取到任何代理节点，将不使用代理。")
+                return
+
+            log_system_event("info", f"获取到 {len(node_urls)} 个节点，开始测速...")
+            
+            for node_url in node_urls:
+                node_config, node_name = self._generate_node_config(node_url.strip())
+                if not node_config:
+                    log_system_event("debug", f"跳过不支持的节点或解析失败: {node_name}")
+                    continue
+                
+                speed = self._test_node_upload_speed(node_config, node_name)
+                if speed > self.best_node_speed:
+                    self.best_node_speed = speed
+                    self.best_node_config = node_config
+            
+            if self.best_node_config:
+                log_system_event("info", "="*60)
+                log_system_event("info", f"🚀 最快节点选择完成！速度: {self.best_node_speed:.2f} MB/s")
+                log_system_event("info", "正在后台启动此节点用于后续所有上传任务...")
+                log_system_event("info", "="*60)
+
+                with open(self.config_path, 'w') as f:
+                    json.dump(self.best_node_config, f)
+                
+                run_command(f"{self.v2ray_path} -c {self.config_path}", "xray.log")
+                if not wait_for_port(self.local_socks_port, timeout=10):
+                    raise RuntimeError("启动最优代理节点失败！")
+                
+                GLOBAL_PROXY_SETTINGS = {
+                    'http': f'socks5h://127.0.0.1:{self.local_socks_port}',
+                    'https': f'socks5h://127.0.0.1:{self.local_socks_port}',
+                }
+            else:
+                log_system_event("warning", "所有节点均测试失败，本次运行将不使用代理。")
+
+        except Exception as e:
+            log_system_event("error", f"设置代理时发生严重错误: {e}。将不使用代理。")
 
 # =============================================================================
 # --- 第 4 步: 字幕提取核心模块 (在子进程中调用) ---
@@ -817,11 +1031,14 @@ def run_subtitle_extraction_pipeline(subtitle_config: dict, chunk_files: list[di
 
 class MixFileCLIClient:
     # 一个简单的用于与 MixFileCLI 后端 API 交互的客户端。
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, proxies: dict = None):
         if not base_url.startswith("http"):
             raise ValueError("Base URL 必须以 http 或 https 开头")
         self.base_url = base_url
         self.session = requests.Session()
+        # 【核心修改】设置代理
+        if proxies:
+            self.session.proxies = proxies
 
     def _make_request(self, method: str, url: str, **kwargs):
         # 统一的请求发送方法，包含错误处理。
@@ -892,7 +1109,8 @@ class MixFileCLIClient:
 # --- A. 应用初始化与任务管理 ---
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False
-
+# 全局代理配置，将在main函数中被设置
+GLOBAL_PROXY_SETTINGS = None
 # 使用字典来存储所有异步任务的状态，并用锁来保证线程安全
 tasks = {}
 tasks_lock = threading.Lock()
@@ -1037,8 +1255,7 @@ def force_shutdown_endpoint():
 
 def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, upload_queue: multiprocessing.Queue, subtitle_config: dict, ai_models: dict):
     """
-    【最终优化版】实现了智能并行策略。
-    先完成冲突的ffmpeg音频提取，然后让视频上传和字幕AI处理并行执行，以达到最高效率。
+    【最终修复版】修复了状态报告延迟问题，确保API状态与后台操作严格同步。
     """
     task_id = task_data['task_id']
     params = task_data['params']
@@ -1094,7 +1311,11 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
                         dl_progress = round((bytes_downloaded / total_size) * 100)
                         _update_status(component="video", details=f"下载中 ({dl_progress}%)...", progress_val=5 + int(dl_progress * 0.2))
         
-        # --- 步骤 2: (如果需要) 串行执行有冲突的音频提取 ---
+        # 【核心修改点 1】下载完成后，明确更新video状态
+        _update_status(component="video", details="下载完成，准备音频提取...")
+
+
+        # --- 步骤 2: (如果需要) 串行执行有冲突的音频预处理 ---
         audio_chunks = None
         if params["extract_subtitle"]:
             mime_type, _ = mimetypes.guess_type(local_file_path)
@@ -1102,22 +1323,22 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
                 _update_status(component="subtitle", status="SKIPPED", details="源文件不是视频格式")
             else:
                 try:
-                    _update_status(component="subtitle", status="RUNNING", details="正在提取音频 (ffmpeg)...", progress_val=30)
-                    # 这个函数的第一部分（ffmpeg调用）是阻塞的，会完成对视频文件的读取
-                    # 我们只调用预处理，不立即调用后续的AI pipeline
+                    _update_status(component="subtitle", status="RUNNING", details="正在预处理音频...", progress_val=30)
                     def sub_progress_callback(stage, details): _update_status(component="subtitle", details=details)
+                    # 这个函数包含了ffmpeg调用和后续的VAD等步骤，它是阻塞的
                     audio_chunks = preprocess_audio_for_subtitles(local_file_path, temp_dir, sub_progress_callback, ai_models)
                 except Exception as e:
                     log_system_event("error", f"音频预处理失败: {e}", in_worker=True)
                     _update_status(component="subtitle", status="FAILED", details=f"音频预处理失败: {e}", error_obj={"code": "AUDIO_EXTRACTION_FAILED", "message": str(e)})
-                    audio_chunks = None # 确保后续步骤不会执行
+                    audio_chunks = None
         else:
             _update_status(component="subtitle", status="SKIPPED", details="用户未请求提取")
 
         # --- 步骤 3: 并行执行视频上传和字幕AI处理 ---
-        # 此时 ffmpeg 已结束，视频文件已释放，可以安全地开始上传
+        # 此时音频预处理已结束，视频文件已释放，可以安全地开始上传
         if params["upload_video"]:
-            _update_status(component="video", status="RUNNING", details="已派发上传任务 (0%)...")
+            # 【核心修改点 2】在派发任务前，立即更新状态
+            _update_status(component="video", status="RUNNING", details="已派发上传任务 (0%)...", progress_val=35)
             upload_queue.put({
                 'task_id': task_id, 'component': 'video', 'local_file_path': str(local_file_path),
                 'filename_for_link': filename, 'api_client_base_url': task_data['api_client_base_url'],
@@ -1201,7 +1422,8 @@ def uploader_process_loop(upload_queue: multiprocessing.Queue, result_queue: mul
                 api_client_base_url = upload_task_data['api_client_base_url']
                 frp_server_addr = upload_task_data['frp_server_addr']
                 
-                api_client = MixFileCLIClient(base_url=api_client_base_url)
+                # api_client = MixFileCLIClient(base_url=api_client_base_url)
+                api_client = MixFileCLIClient(base_url=api_client_base_url, proxies=GLOBAL_PROXY_SETTINGS)
                 log_system_event("info", f"[上传进程] [{component}] 开始处理上传任务，文件: {local_file_path_str}", in_worker=True)
                 
                 _update_uploader_status("RUNNING", details="正在上传 (0%)...")
@@ -1429,6 +1651,14 @@ def main():
         run_command("java -jar mixfile-cli.jar", "mixfile.log")
         if not wait_for_port(MIXFILE_LOCAL_PORT):
             raise RuntimeError("MixFileCLI 服务启动失败，请检查 mixfile.log。")
+
+        # 【核心新增】--- 4.5 启动并配置最优代理 ---
+        v2ray_sub_url = subtitle_config_global.get("V2RAY_SUB_URL")
+        if v2ray_sub_url:
+            proxy_manager = ProxyManager(sub_url=v2ray_sub_url, mixfile_base_url=api_client_base_url)
+            proxy_manager.setup_best_proxy()
+        else:
+            log_system_event("info", "未在配置中找到 V2RAY_SUB_URL，不启用代理功能。")
 
         # --- 5. 初始化多进程队列和工作进程 ---
         TASK_QUEUE = multiprocessing.Queue()
