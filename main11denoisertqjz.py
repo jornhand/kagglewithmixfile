@@ -1026,7 +1026,7 @@ def force_shutdown_endpoint():
 
 def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, ai_models: dict):
     #
-    # 处理一个完整的媒体任务，适配新的面板友好型API输出。
+    # 处理一个完整的媒体任务，使用手动线程管理实现安全的并行。
     #
     
     # --- 1. 初始化 ---
@@ -1040,7 +1040,6 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, a
     temp_dir = Path(f"/kaggle/working/task_{task_id}")
     temp_dir.mkdir(exist_ok=True)
 
-    # 内部状态，用于追踪各组件情况
     _internal_status = {
         "progress": 0,
         "results": {
@@ -1049,34 +1048,24 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, a
         }
     }
 
-    # 定义一个新的、更强大的状态更新函数
     def _update_status(component=None, status=None, details=None, progress_val=None, output=None, error_obj=None):
+        # 这个辅助函数无需修改，保持原样
         payload = {'type': 'status_update', 'task_id': task_id, 'payload': {}}
-        
         if component and component in _internal_status["results"]:
             if status: _internal_status["results"][component]["status"] = status
             if details: _internal_status["results"][component]["details"] = details
             if output:
-                if _internal_status["results"][component]["output"] is None:
-                    _internal_status["results"][component]["output"] = {}
+                if _internal_status["results"][component]["output"] is None: _internal_status["results"][component]["output"] = {}
                 _internal_status["results"][component]["output"].update(output)
             if error_obj: _internal_status["results"][component]["error"] = error_obj
-        
-        if progress_val is not None:
-            _internal_status["progress"] = progress_val
-        
-        payload['payload'] = {
-            "progress": _internal_status["progress"],
-            "results": _internal_status["results"]
-        }
+        if progress_val is not None: _internal_status["progress"] = progress_val
+        payload['payload'] = {"progress": _internal_status["progress"], "results": _internal_status["results"]}
         result_queue.put(payload)
 
-    # 主任务逻辑
     try:
-        # --- 2. 下载源文件 ---
+        # --- 2. 下载源文件 (串行前置步骤) ---
         _update_status(component="video", status="RUNNING", details="开始下载文件...", progress_val=5)
         _update_status(component="subtitle", status="RUNNING", details="等待视频下载...")
-        
         file_url = params['url']
         filename = unquote(file_url.split("/")[-1].split("?")[0] or f"file_{task_id}")
         local_file_path = temp_dir / filename
@@ -1091,13 +1080,11 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, a
                     bytes_downloaded += len(chunk)
                     if total_size > 0:
                         dl_progress = round((bytes_downloaded / total_size) * 100)
-                        _update_status(component="video", details=f"下载中 ({dl_progress}%)...", progress_val=5 + int(dl_progress * 0.2)) # 下载占总进度20%
+                        _update_status(component="video", details=f"下载中 ({dl_progress}%)...", progress_val=5 + int(dl_progress * 0.2))
 
-        # --- 3. 验证与分发任务 ---
-        mime_type, _ = mimetypes.guess_type(local_file_path)
-        is_video = bool(mime_type and mime_type.startswith("video"))
-
-        # 定义两个核心子任务
+        # --- 3. 【核心修改】: 使用手动线程实现并行 ---
+        
+        # 定义任务A: 视频上传
         def video_upload_task():
             if not params["upload_video"]:
                 _update_status(component="video", status="SKIPPED", details="用户未请求上传")
@@ -1114,25 +1101,24 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, a
             except Exception as e:
                 _update_status(component="video", status="FAILED", details=str(e), error_obj={"code": "UPLOAD_FAILED", "message": str(e)})
 
+        # 定义任务B: 字幕处理
         def subtitle_task():
             if not params["extract_subtitle"]:
                 _update_status(component="subtitle", status="SKIPPED", details="用户未请求提取")
                 return
+            
+            mime_type, _ = mimetypes.guess_type(local_file_path)
+            is_video = bool(mime_type and mime_type.startswith("video"))
             if not is_video:
                 _update_status(component="subtitle", status="SKIPPED", details="源文件不是视频格式")
                 return
+                
             try:
                 _update_status(component="subtitle", status="RUNNING", details="开始提取...", progress_val=35)
-                
-                def sub_progress_callback(stage, details):
-                    _update_status(component="subtitle", details=details)
-
+                def sub_progress_callback(stage, details): _update_status(component="subtitle", details=details)
                 audio_chunks = preprocess_audio_for_subtitles(local_file_path, temp_dir, sub_progress_callback, ai_models)
                 srt_content = run_subtitle_extraction_pipeline(subtitle_config, audio_chunks, sub_progress_callback)
-                
-                if not srt_content:
-                    raise RuntimeError("未能生成有效的字幕内容。")
-
+                if not srt_content: raise RuntimeError("未能生成有效的字幕内容。")
                 srt_base64 = base64.b64encode(srt_content.encode('utf-8')).decode('utf-8')
                 _update_status(component="subtitle", output={"contentBase64": srt_base64})
                 
@@ -1141,7 +1127,6 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, a
                     srt_filename = local_file_path.stem + ".srt"
                     srt_path = temp_dir / srt_filename
                     with open(srt_path, "w", encoding="utf-8") as f: f.write(srt_content)
-                    
                     response = local_api_client.upload_file(str(srt_path))
                     if isinstance(response, requests.Response) and response.ok:
                         share_code = response.text.strip()
@@ -1154,10 +1139,15 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, a
             except Exception as e:
                 _update_status(component="subtitle", status="FAILED", details=str(e), error_obj={"code": "TRANSCRIPTION_FAILED", "message": str(e)})
 
-        # 使用线程池并发执行两个子任务
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            executor.submit(video_upload_task)
-            executor.submit(subtitle_task)
+        # 创建并启动后台线程来处理视频上传
+        video_thread = threading.Thread(target=video_upload_task)
+        video_thread.start()
+
+        # 在主线程中直接执行字幕任务
+        subtitle_task()
+
+        # 等待后台的视频上传线程执行完毕
+        video_thread.join()
 
         # --- 4. 任务完成 ---
         final_video_status = _internal_status["results"]["video"]["status"]
@@ -1165,7 +1155,7 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, a
         
         final_status = "SUCCESS"
         if "FAILED" in [final_video_status, final_subtitle_status]:
-            if "SUCCESS" in [final_video_status, final_subtitle_status]:
+            if "SUCCESS" in [final_video_status, final_subtitle_status] or "SKIPPED" in [final_video_status, final_subtitle_status]:
                 final_status = "PARTIAL_SUCCESS"
             else:
                 final_status = "FAILED"
