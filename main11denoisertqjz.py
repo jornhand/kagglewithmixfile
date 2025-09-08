@@ -413,47 +413,61 @@ class WarpManager:
         self.warp_log_path = "/tmp/warp-svc.log"
 
     def _install_warp(self):
+        """【依赖修复版】手动下载最新版 .deb 包，并使用 apt 解决依赖进行安装。"""
         if self.warp_cli_path.exists():
-            # 即使文件存在，我们也检查一下版本，防止是旧版本残留
             try:
                 version_proc = subprocess.run("warp-cli --version", shell=True, capture_output=True, text=True)
-                if "2025." in version_proc.stdout or "2024." in version_proc.stdout: # 检查是否是较新的年份版本
+                # 检查一个较新的版本特征，例如"2024."
+                if "2024." in version_proc.stdout or "2025." in version_proc.stdout:
                     log_system_event("info", "检测到新版 WARP 客户端已安装，跳过。", in_worker=True)
                     return True
+                else:
+                    log_system_event("info", "检测到旧版 WARP，将尝试更新...", in_worker=True)
             except Exception:
-                pass # 如果检查失败，就继续安装
+                pass
 
         log_system_event("info", "正在手动下载并安装最新版 Cloudflare WARP 客户端...", in_worker=True)
         try:
-            # 【核心修复】直接从官方发布页下载 .deb 包
-            warp_deb_url = "https://pkg.cloudflareclient.com/uploads/cloudflare-warp-arm64.deb" # <--- 注意: 确认Kaggle的CPU架构
-            
-            # 检查Kaggle的CPU架构
+            # 自动检测CPU架构
             arch_proc = subprocess.run("dpkg --print-architecture", shell=True, capture_output=True, text=True)
             arch = arch_proc.stdout.strip()
+
+            # Cloudflare 似乎不再提供带版本号的稳定URL，我们直接用架构名
             if arch == "amd64":
-                warp_deb_url = "https://pkg.cloudflareclient.com/uploads/cloudflare-warp_2024.5.263-1_amd64.deb"
+                warp_deb_url = "https://pkg.cloudflareclient.com/cloudflare-warp_amd64.deb"
             elif arch == "arm64":
-                 warp_deb_url = "https://pkg.cloudflareclient.com/uploads/cloudflare-warp_2024.5.263-1_arm64.deb"
+                warp_deb_url = "https://pkg.cloudflareclient.com/cloudflare-warp_arm64.deb"
             else:
                 log_system_event("error", f"不支持的CPU架构: {arch}", in_worker=True)
                 return False
 
             log_system_event("info", f"检测到架构: {arch}, 下载URL: {warp_deb_url}", in_worker=True)
 
+            # 【核心修复】使用 apt install 来自动处理本地 .deb 包的依赖关系
             install_cmd = (
+                "echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ focal main' | sudo tee /etc/apt/sources.list.d/cloudflare-client.list && "
+                "sudo apt-get update && " # 确保 apt 的源列表是最新的
                 f"wget -q -O /tmp/cloudflare-warp.deb {warp_deb_url} && "
-                "sudo dpkg -i /tmp/cloudflare-warp.deb"
+                "sudo apt-get install -y /tmp/cloudflare-warp.deb"
             )
             
             env = os.environ.copy()
             env["DEBIAN_FRONTEND"] = "noninteractive"
             
-            process = subprocess.run(install_cmd, shell=True, capture_output=True, text=True, env=env)
+            # 使用 Popen 并实时打印输出来进行调试
+            log_system_event("info", "执行安装命令...", in_worker=True)
+            process = subprocess.Popen(
+                install_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                text=True, env=env, bufsize=1, universal_newlines=True
+            )
             
-            # dpkg 安装可能会因为依赖问题返回非0代码，但只要 warp-cli 安装成功就行
-            if not self.warp_cli_path.exists():
-                log_system_event("error", f"WARP 手动安装失败: {process.stderr}", in_worker=True)
+            for line in process.stdout:
+                log_system_event("debug", f"[apt] {line.strip()}", in_worker=True)
+            
+            process.wait()
+
+            if process.returncode != 0:
+                log_system_event("error", f"WARP 手动安装失败，返回码: {process.returncode}", in_worker=True)
                 return False
             
             log_system_event("info", "✅ WARP 客户端手动安装/更新成功。", in_worker=True)
@@ -461,7 +475,6 @@ class WarpManager:
         except Exception as e:
             log_system_event("error", f"手动安装 WARP 时发生异常: {e}", in_worker=True)
             return False
-
     # ... _start_warp_daemon 方法保持不变 ...
     def _start_warp_daemon(self):
         try:
