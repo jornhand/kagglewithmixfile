@@ -432,7 +432,7 @@ class ProxyManager:
             return []
 
     def _generate_node_config(self, node_url):
-        """根据节点URL生成Xray的JSON配置。"""
+        """【修改后】根据节点URL生成Xray的JSON配置，兼容新版Xray对VLESS的要求。"""
         try:
             # 基础配置模板
             config = {
@@ -446,13 +446,23 @@ class ProxyManager:
                 "outbounds": [{"protocol": "freedom", "settings": {}}]
             }
             
+            # 对节点名称进行URL解码，以正确显示中文等字符
+            node_name_raw = urlparse(node_url).fragment
+            node_name = unquote(node_name_raw) if node_name_raw else "Unnamed Node"
+
             parsed_url = urlparse(node_url)
             protocol = parsed_url.scheme
             
             outbound = {"protocol": protocol, "settings": {}}
             
             if protocol == "vmess":
-                decoded_vmess = json.loads(base64.b64decode(parsed_url.netloc).decode('utf-8'))
+                # base64 解码可能会失败，需要捕获
+                try:
+                    decoded_vmess_str = base64.b64decode(parsed_url.netloc).decode('utf-8')
+                    decoded_vmess = json.loads(decoded_vmess_str)
+                except (binascii.Error, json.JSONDecodeError, UnicodeDecodeError):
+                     return None, f"Invalid VMess format for node {node_name}"
+
                 outbound["settings"]["vnext"] = [{
                     "address": decoded_vmess["add"],
                     "port": int(decoded_vmess["port"]),
@@ -460,35 +470,56 @@ class ProxyManager:
                 }]
                 stream_settings = {"network": decoded_vmess.get("net", "tcp")}
                 if stream_settings["network"] == "ws":
-                    stream_settings["wsSettings"] = {"path": decoded_vmess.get("path", "/")}
+                    ws_settings = {"path": decoded_vmess.get("path", "/")}
+                    host = decoded_vmess.get("host")
+                    if host:
+                        ws_settings["headers"] = {"Host": host}
+                    stream_settings["wsSettings"] = ws_settings
                 if decoded_vmess.get("tls", "") == "tls":
                      stream_settings["security"] = "tls"
-                     stream_settings["tlsSettings"] = {"serverName": decoded_vmess.get("host", decoded_vmess["add"])}
+                     stream_settings["tlsSettings"] = {"serverName": decoded_vmess.get("sni", decoded_vmess.get("host", decoded_vmess["add"]))}
                 outbound["streamSettings"] = stream_settings
 
             elif protocol == "vless":
                 qs = parse_qs(parsed_url.query)
+                
+                # 【核心修复】为 user 对象添加 "encryption": "none"
+                user_obj = {
+                    "id": parsed_url.username,
+                    "encryption": "none",
+                    "flow": qs.get("flow", [None])[0]
+                }
+                # 移除flow为None的情况，以获得更好的兼容性
+                if user_obj["flow"] is None:
+                    del user_obj["flow"]
+                    
                 outbound["settings"]["vnext"] = [{
                     "address": parsed_url.hostname,
                     "port": parsed_url.port,
-                    "users": [{"id": parsed_url.username, "flow": qs.get("flow", [None])[0]}]
+                    "users": [user_obj]
                 }]
+                
                 stream_settings = {"network": qs.get("type", ["tcp"])[0]}
                 if stream_settings["network"] == "ws":
-                    stream_settings["wsSettings"] = {"path": qs.get("path", ["/"])[0]}
+                    ws_settings = {"path": unquote(qs.get("path", ["/"])[0])}
+                    host = qs.get("host", [None])[0] or qs.get("sni", [None])[0]
+                    if host:
+                         ws_settings["headers"] = {"Host": unquote(host)}
+                    stream_settings["wsSettings"] = ws_settings
                 if qs.get("security", ["none"])[0] == "tls":
                     stream_settings["security"] = "tls"
                     stream_settings["tlsSettings"] = {"serverName": qs.get("sni", [parsed_url.hostname])[0]}
                 outbound["streamSettings"] = stream_settings
 
             else:
-                return None, "Unsupported"
+                return None, f"Unsupported protocol: {protocol}"
 
             config["outbounds"][0] = outbound
-            return config, parsed_url.fragment or parsed_url.hostname # Node name
+            # 使用解码后的节点名称
+            return config, node_name
         except Exception as e:
-            return None, str(e)
-
+            return None, f"Error parsing node {node_name}: {e}"
+            
     def _test_node_upload_speed(self, node_config, node_name):
         """启动节点并测试其上传速度，返回MB/s。"""
         log_system_event("info", f"  -> 正在测试节点: {node_name}...")
