@@ -432,7 +432,7 @@ class ProxyManager:
             return []
 
     def _generate_node_config(self, node_url):
-        """【终极修复版】精确解析VLESS链接中的 host, path, sni 参数，以兼容CDN节点。"""
+        """【最终定稿版】严格参照标准配置文件，补全 fingerprint 等关键字段。"""
         try:
             # 基础配置模板
             config = {
@@ -481,10 +481,14 @@ class ProxyManager:
             elif protocol == "vless":
                 qs = parse_qs(parsed_url.query)
                 
+                # 【核心修复 #1】构建一个更完整的 user 对象
                 user_obj = {
                     "id": parsed_url.username,
                     "encryption": "none",
-                    "flow": qs.get("flow", [None])[0]
+                    "flow": qs.get("flow", [None])[0],
+                    # 添加标准默认值以增强兼容性
+                    "alterId": 0,
+                    "security": "auto"
                 }
                 if user_obj["flow"] is None: del user_obj["flow"]
                     
@@ -497,28 +501,29 @@ class ProxyManager:
                 stream_settings = {"network": qs.get("type", ["tcp"])[0]}
                 
                 if stream_settings["network"] == "ws":
-                    # 【核心修复】精确处理 wsSettings 和 headers
                     ws_path = unquote(qs.get("path", ["/"])[0])
                     ws_host = unquote(qs.get("host", [""])[0])
-                    
                     ws_settings = {"path": ws_path}
                     if ws_host:
-                        # 如果 host 存在，必须将其加入 headers
                         ws_settings["headers"] = {"Host": ws_host}
-                    
                     stream_settings["wsSettings"] = ws_settings
                 
                 if qs.get("security", ["none"])[0] == "tls":
                     stream_settings["security"] = "tls"
                     
-                    # 【核心修复】精确处理 tlsSettings 和 sni
-                    # SNI 优先使用查询参数中的 'sni'，如果不存在，则使用 'host'，
-                    # 如果两者都不存在，则回退到地址本身。这符合标准客户端的行为。
                     tls_sni = unquote(qs.get("sni", [""])[0]) or unquote(qs.get("host", [""])[0]) or parsed_url.hostname
                     
-                    tls_settings = {"serverName": tls_sni}
+                    # 【核心修复 #2】添加 fingerprint 和其他 TLS 设置
+                    # 从查询参数中获取fingerprint，如果不存在则默认为 "random"
+                    fp = qs.get("fp", ["random"])[0]
+
+                    tls_settings = {
+                        "serverName": tls_sni,
+                        "fingerprint": fp,
+                        "allowInsecure": False, # 默认为False以保证安全
+                        "show": False
+                    }
                     
-                    # 检查是否有alpn参数
                     alpn = qs.get("alpn")
                     if alpn:
                         tls_settings["alpn"] = [val for val in alpn[0].split(',') if val]
@@ -533,8 +538,11 @@ class ProxyManager:
             config["outbounds"][0] = outbound
             return config, node_name
         except Exception as e:
+            # 增加异常堆栈打印，便于调试
+            import traceback
+            traceback.print_exc()
             return None, f"Error parsing node '{node_name}': {e}"
-
+            
     def _test_node_upload_speed(self, node_config, node_name):
         """启动节点并测试其上传速度，返回MB/s。"""
         log_system_event("info", f"  -> 正在测试节点: {node_name}...")
