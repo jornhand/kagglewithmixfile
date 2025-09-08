@@ -386,13 +386,13 @@ def _shutdown_notebook_kernel_immediately():
 
 #删了我就安全了
 # 放在 ProxyManager 类定义之前
+# 放在 ProxyManager 类定义之前
 class WarpManager:
-    """一个简单的辅助类，用于管理 WARP 客户端的安装和连接。"""
+    """【守护进程修复版】一个简单的辅助类，用于管理 WARP 客户端的安装和连接。"""
     
     _instance = None
     
     def __new__(cls):
-        # 使用单例模式，确保整个应用生命周期中只尝试安装和初始化一次
         if cls._instance is None:
             cls._instance = super(WarpManager, cls).__new__(cls)
             cls._instance._initialized = False
@@ -404,6 +404,7 @@ class WarpManager:
         self.warp_cli_path = Path("/usr/bin/warp-cli")
         self.is_connected = False
         self._initialized = True
+        self._warp_svc_process = None
 
     def _install_warp(self):
         if self.warp_cli_path.exists():
@@ -412,13 +413,11 @@ class WarpManager:
         
         log_system_event("info", "正在安装 Cloudflare WARP 客户端...", in_worker=True)
         try:
-            # Cloudflare 官方安装脚本
             install_cmd = (
                 "curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg && "
                 "echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ focal main' | sudo tee /etc/apt/sources.list.d/cloudflare-client.list && "
                 "sudo apt-get update && sudo apt-get install -y cloudflare-warp"
             )
-            # Kaggle 环境需要非交互式安装
             env = os.environ.copy()
             env["DEBIAN_FRONTEND"] = "noninteractive"
             
@@ -433,35 +432,64 @@ class WarpManager:
             log_system_event("error", f"安装 WARP 时发生异常: {e}", in_worker=True)
             return False
 
+    def _start_warp_daemon(self):
+        """启动 WARP 的后台守护进程。"""
+        # 检查进程是否已在运行
+        try:
+            subprocess.run(['pgrep', '-f', 'warp-svc'], check=True, capture_output=True)
+            log_system_event("info", "WARP 守护进程已在运行。", in_worker=True)
+            return True
+        except subprocess.CalledProcessError:
+            # 进程不在运行，启动它
+            log_system_event("info", "正在启动 WARP 守护进程...", in_worker=True)
+            # 在 Kaggle 环境中，直接运行可执行文件比使用 systemd 更可靠
+            self._warp_svc_process = run_command("/usr/bin/warp-svc")
+            # 等待几秒钟让守护进程初始化
+            time.sleep(3)
+            # 再次检查
+            try:
+                subprocess.run(['pgrep', '-f', 'warp-svc'], check=True, capture_output=True)
+                log_system_event("info", "✅ WARP 守护进程启动成功。", in_worker=True)
+                return True
+            except subprocess.CalledProcessError:
+                log_system_event("error", "WARP 守护进程启动失败！", in_worker=True)
+                return False
+
     def connect(self):
         if self.is_connected:
             return True
             
-        if not self._install_warp():
+        if not self._install_warp() or not self._start_warp_daemon():
             return False
 
-        log_system_event("info", "正在连接到 Cloudflare WARP 网络...", in_worker=True)
+        log_system_event("info", "正在配置并连接到 Cloudflare WARP 网络...", in_worker=True)
         try:
-            # 设置为代理模式，这样它会开放一个本地SOCKS5端口
-            run_command("warp-cli set-mode proxy").wait()
-            # 注册（如果需要）并连接
-            run_command("warp-cli --accept-tos register").wait()
-            # 有时需要一点时间来完成注册
-            time.sleep(3)
-            # 连接
-            connect_proc = run_command("warp-cli connect")
-            # 等待几秒钟让连接建立
+            # 【核心修复】使用新版命令，并分步执行
+            
+            # 1. 接受服务条款
+            run_command("warp-cli --accept-tos registration new").wait()
+            time.sleep(2)
+
+            # 2. 设置为代理模式
+            # 新版本可能没有 set-mode，而是通过 set-proxy-port 设置
+            run_command("warp-cli set-proxy-port 40000").wait()
+            time.sleep(1)
+
+            # 3. 连接
+            run_command("warp-cli connect").wait()
             time.sleep(5)
 
-            # 检查连接状态
+            # 4. 检查连接状态
             status_proc = subprocess.run("warp-cli status", shell=True, capture_output=True, text=True)
             if "Status: Connected" in status_proc.stdout:
                 log_system_event("info", "✅ WARP 连接成功！", in_worker=True)
                 self.is_connected = True
                 return True
             else:
-                log_system_event("error", f"WARP 连接失败。状态: {status_proc.stdout}", in_worker=True)
-                connect_proc.terminate()
+                log_system_event("error", f"WARP 连接失败。状态详情: {status_proc.stdout}", in_worker=True)
+                # 尝试获取更多调试信息
+                settings_proc = subprocess.run("warp-cli settings", shell=True, capture_output=True, text=True)
+                log_system_event("error", f"WARP 配置: {settings_proc.stdout}", in_worker=True)
                 return False
         except Exception as e:
             log_system_event("error", f"连接 WARP 时发生异常: {e}", in_worker=True)
@@ -472,6 +500,8 @@ class WarpManager:
             log_system_event("info", "正在断开 WARP 连接...", in_worker=True)
             run_command("warp-cli disconnect").wait()
             self.is_connected = False
+        # 不关闭守护进程，让它在后台待命，下次连接更快
+
 # =============================================================================
 # --- (新增模块) 第 3.5 步: V2Ray 代理管理器 ---
 # =============================================================================
@@ -1622,7 +1652,7 @@ def uploader_process_loop(upload_queue: multiprocessing.Queue, result_queue: mul
     finally:
         shutdown_all_proxies()
         log_system_event("info", "上传专用工作进程已关闭。", in_worker=True)
-        
+
 def worker_process_loop(task_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue, upload_queue: multiprocessing.Queue):
     """
     媒体处理工作进程循环，负责媒体处理并将上传任务外包。
