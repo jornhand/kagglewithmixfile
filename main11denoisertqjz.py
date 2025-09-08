@@ -389,8 +389,9 @@ def _shutdown_notebook_kernel_immediately():
 # 放在 ProxyManager 类定义之前
 # 放在 ProxyManager 类定义之前
 # 放在 ProxyManager 类定义之前
+# 放在 ProxyManager 类定义之前
 class WarpManager:
-    """【防火墙/命令修复版】简化并修正了WARP的命令序列，以适应无特权的容器环境。"""
+    """【Proxy Mode 强制版】专门为受限容器环境设计，强制使用SOCKS5代理模式。"""
     
     _instance = None
     
@@ -407,11 +408,11 @@ class WarpManager:
         self.is_connected = False
         self._initialized = True
         self._warp_svc_process = None
+        self.warp_log_path = "/tmp/warp-svc.log" # 将日志输出到固定文件
 
     def _install_warp(self):
         if self.warp_cli_path.exists():
             return True
-        
         log_system_event("info", "正在安装 Cloudflare WARP 客户端...", in_worker=True)
         try:
             install_cmd = (
@@ -421,12 +422,10 @@ class WarpManager:
             )
             env = os.environ.copy()
             env["DEBIAN_FRONTEND"] = "noninteractive"
-            
             process = subprocess.run(install_cmd, shell=True, capture_output=True, text=True, env=env)
             if process.returncode != 0:
                 log_system_event("error", f"WARP 安装失败: {process.stderr}", in_worker=True)
                 return False
-            
             log_system_event("info", "✅ WARP 客户端安装成功。", in_worker=True)
             return True
         except Exception as e:
@@ -439,8 +438,8 @@ class WarpManager:
             return True
         except subprocess.CalledProcessError:
             log_system_event("info", "正在启动 WARP 守护进程...", in_worker=True)
-            # 将日志重定向，避免刷屏
-            self._warp_svc_process = run_command("/usr/bin/warp-svc", "warp-svc.log")
+            # 将日志重定向到固定文件，便于调试
+            self._warp_svc_process = run_command(f"/usr/bin/warp-svc > {self.warp_log_path} 2>&1")
             time.sleep(3)
             try:
                 subprocess.run(['pgrep', '-f', 'warp-svc'], check=True, capture_output=True)
@@ -457,33 +456,37 @@ class WarpManager:
         if not self._install_warp() or not self._start_warp_daemon():
             return False
 
-        log_system_event("info", "正在配置并连接到 Cloudflare WARP 网络...", in_worker=True)
+        log_system_event("info", "正在配置并连接到 Cloudflare WARP (Proxy Mode)...", in_worker=True)
         try:
-            # 【核心修复】这是一个经过验证的、在无特权容器中可靠的命令序列
+            # 【核心修复】精简为Proxy Mode专用命令序列
             
             # 1. 确保断开，从干净状态开始
             run_command("warp-cli --accept-tos disconnect").wait()
-            time.sleep(1)
             
             # 2. 注册
             run_command("warp-cli --accept-tos registration new").wait()
-            time.sleep(2)
-
-            # 3. 连接。在Proxy模式下，connect本身不会修改防火墙。
+            
+            # 3. 明确设置模式为Proxy。这是最关键的一步。
+            # 即使命令不存在，也尝试执行，然后检查结果
+            run_command("warp-cli set-mode proxy").wait()
+            
+            # 4. 连接
             run_command("warp-cli --accept-tos connect").wait()
             time.sleep(5)
 
-            # 4. 检查连接状态
+            # 5. 检查连接状态
             status_proc = subprocess.run("warp-cli status", shell=True, capture_output=True, text=True)
-            if "Status: Connected" in status_proc.stdout:
-                log_system_event("info", "✅ WARP 连接成功！", in_worker=True)
-                # 连接成功后，再设置代理模式。这个顺序更可靠。
-                run_command("warp-cli set-mode proxy").wait()
-                run_command("warp-cli set-proxy-port 40000").wait()
+            if "Status: Connected" in status_proc.stdout and "Mode: Proxy" in status_proc.stdout:
+                log_system_event("info", "✅ WARP 在 Proxy Mode 下连接成功！", in_worker=True)
                 self.is_connected = True
                 return True
             else:
-                log_system_event("error", f"WARP 连接失败。状态详情: {status_proc.stdout}", in_worker=True)
+                log_system_event("error", f"WARP 连接或进入Proxy Mode失败。状态详情: {status_proc.stdout.strip()}", in_worker=True)
+                # 打印守护进程日志的最后几行以获取线索
+                if os.path.exists(self.warp_log_path):
+                    with open(self.warp_log_path, 'r') as f:
+                        last_lines = f.readlines()[-10:]
+                    log_system_event("error", "WARP守护进程最新日志:\n" + "".join(last_lines), in_worker=True)
                 return False
         except Exception as e:
             log_system_event("error", f"连接 WARP 时发生异常: {e}", in_worker=True)
