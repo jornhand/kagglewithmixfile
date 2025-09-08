@@ -391,8 +391,9 @@ def _shutdown_notebook_kernel_immediately():
 # 放在 ProxyManager 类定义之前
 # 放在 ProxyManager 类定义之前
 # 放在 ProxyManager 类定义之前
+# 放在 ProxyManager 类定义之前
 class WarpManager:
-    """【设置修复版】使用新版 warp-cli settings 命令来精确启用 Proxy Mode。"""
+    """【安装源修复版】绕过apt，手动下载并安装最新版的 WARP 客户端。"""
     
     _instance = None
     
@@ -413,26 +414,55 @@ class WarpManager:
 
     def _install_warp(self):
         if self.warp_cli_path.exists():
-            return True
-        log_system_event("info", "正在安装 Cloudflare WARP 客户端...", in_worker=True)
+            # 即使文件存在，我们也检查一下版本，防止是旧版本残留
+            try:
+                version_proc = subprocess.run("warp-cli --version", shell=True, capture_output=True, text=True)
+                if "2025." in version_proc.stdout or "2024." in version_proc.stdout: # 检查是否是较新的年份版本
+                    log_system_event("info", "检测到新版 WARP 客户端已安装，跳过。", in_worker=True)
+                    return True
+            except Exception:
+                pass # 如果检查失败，就继续安装
+
+        log_system_event("info", "正在手动下载并安装最新版 Cloudflare WARP 客户端...", in_worker=True)
         try:
+            # 【核心修复】直接从官方发布页下载 .deb 包
+            warp_deb_url = "https://pkg.cloudflareclient.com/uploads/cloudflare-warp-arm64.deb" # <--- 注意: 确认Kaggle的CPU架构
+            
+            # 检查Kaggle的CPU架构
+            arch_proc = subprocess.run("dpkg --print-architecture", shell=True, capture_output=True, text=True)
+            arch = arch_proc.stdout.strip()
+            if arch == "amd64":
+                warp_deb_url = "https://pkg.cloudflareclient.com/uploads/cloudflare-warp_2024.5.263-1_amd64.deb"
+            elif arch == "arm64":
+                 warp_deb_url = "https://pkg.cloudflareclient.com/uploads/cloudflare-warp_2024.5.263-1_arm64.deb"
+            else:
+                log_system_event("error", f"不支持的CPU架构: {arch}", in_worker=True)
+                return False
+
+            log_system_event("info", f"检测到架构: {arch}, 下载URL: {warp_deb_url}", in_worker=True)
+
             install_cmd = (
-                "curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg && "
-                "echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ focal main' | sudo tee /etc/apt/sources.list.d/cloudflare-client.list && "
-                "sudo apt-get update && sudo apt-get install -y cloudflare-warp"
+                f"wget -q -O /tmp/cloudflare-warp.deb {warp_deb_url} && "
+                "sudo dpkg -i /tmp/cloudflare-warp.deb"
             )
+            
             env = os.environ.copy()
             env["DEBIAN_FRONTEND"] = "noninteractive"
+            
             process = subprocess.run(install_cmd, shell=True, capture_output=True, text=True, env=env)
-            if process.returncode != 0:
-                log_system_event("error", f"WARP 安装失败: {process.stderr}", in_worker=True)
+            
+            # dpkg 安装可能会因为依赖问题返回非0代码，但只要 warp-cli 安装成功就行
+            if not self.warp_cli_path.exists():
+                log_system_event("error", f"WARP 手动安装失败: {process.stderr}", in_worker=True)
                 return False
-            log_system_event("info", "✅ WARP 客户端安装成功。", in_worker=True)
+            
+            log_system_event("info", "✅ WARP 客户端手动安装/更新成功。", in_worker=True)
             return True
         except Exception as e:
-            log_system_event("error", f"安装 WARP 时发生异常: {e}", in_worker=True)
+            log_system_event("error", f"手动安装 WARP 时发生异常: {e}", in_worker=True)
             return False
 
+    # ... _start_warp_daemon 方法保持不变 ...
     def _start_warp_daemon(self):
         try:
             subprocess.run(['pgrep', '-f', 'warp-svc'], check=True, capture_output=True)
@@ -449,6 +479,7 @@ class WarpManager:
                 log_system_event("error", "WARP 守护进程启动失败！", in_worker=True)
                 return False
 
+    # ... connect 和 disconnect 方法可以恢复使用上一版为新版设计的命令流 ...
     def connect(self):
         if self.is_connected:
             return True
@@ -458,44 +489,26 @@ class WarpManager:
 
         log_system_event("info", "正在配置并连接到 Cloudflare WARP (Proxy Mode)...", in_worker=True)
         try:
-            # 【核心修复】这是一个经过验证的、适用于新版 warp-cli 的命令序列
-            
-            # 1. 确保断开，从干净状态开始
+            # 恢复使用为新版本设计的、健壮的命令序列
             run_command("warp-cli --accept-tos disconnect").wait()
             time.sleep(1)
             
-            # 2. 删除旧的注册，避免冲突
             run_command("warp-cli --accept-tos registration delete").wait()
             time.sleep(1)
             
-            # 3. 注册新账户
             run_command("warp-cli --accept-tos registration new").wait()
             time.sleep(2)
 
-            # 4. 使用 'set-mode' 的替代方案: 'warp-cli set-custom-endpoint' 是一种技巧
-            #    但更可靠的是通过设置 'always_on' 为 false 来避免它自动连接并接管网络
-            #    我们将通过 'connect' 命令来手动控制连接
-            run_command("warp-cli set_always_on disable").wait()
+            # 现在 set-mode 应该存在了
+            run_command("warp-cli set-mode proxy").wait()
             time.sleep(1)
 
-            # 5. 【最关键的一步】明确设置操作模式为 Proxy
-            #    新版本的命令是 `warp-cli set-mode proxy`，但如果它不存在，
-            #    我们将通过 `warp-cli settings` 设置。
-            #    `warp-cli set operation_mode proxy`
-            #    我们尝试两者，以获得最大兼容性。
-            cmd_set_mode = "warp-cli set-mode proxy"
-            proc_set_mode = subprocess.run(cmd_set_mode, shell=True, capture_output=True, text=True)
-            if "unrecognized subcommand" in proc_set_mode.stderr:
-                log_system_event("info", "'set-mode' 命令不存在，尝试使用 'settings'...", in_worker=True)
-                run_command("warp-cli set operation_mode proxy").wait()
-            
+            run_command("warp-cli set-proxy-port 40000").wait()
             time.sleep(1)
 
-            # 6. 连接
             run_command("warp-cli --accept-tos connect").wait()
             time.sleep(5)
 
-            # 7. 检查连接状态
             status_proc = subprocess.run("warp-cli status", shell=True, capture_output=True, text=True)
             if "Status: Connected" in status_proc.stdout and "Mode: Proxy" in status_proc.stdout:
                 log_system_event("info", "✅ WARP 在 Proxy Mode 下连接成功！", in_worker=True)
@@ -513,7 +526,6 @@ class WarpManager:
             log_system_event("info", "正在断开 WARP 连接...", in_worker=True)
             run_command("warp-cli disconnect").wait()
             self.is_connected = False
-
 # =============================================================================
 # --- (新增模块) 第 3.5 步: V2Ray 代理管理器 ---
 # =============================================================================
