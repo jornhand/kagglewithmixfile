@@ -33,7 +33,8 @@ import mimetypes
 from pathlib import Path
 from datetime import timedelta
 from urllib.parse import urljoin, quote, unquote
-from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed, TimeoutError
+
 
 # --- 多进程与队列 ---
 import multiprocessing
@@ -768,7 +769,7 @@ def run_subtitle_extraction_pipeline(subtitle_config: dict, chunk_files: list[di
                 # 这个时间应该大于单个批次处理的最大可能时间（包括重试）
                 # timeout = (单个请求超时 + 重试等待) * 重试次数，再加一些余量
                 # timeout = (360s + 5s*1 + 5s*2) * 3 = (375s) * 3 ~= 20分钟
-                result_timeout = 4 * 60 # 20分钟
+                result_timeout = 10 * 60 # 20分钟
                 
                 # 获取已完成任务的结果。如果子进程中发生异常，.result()会重新抛出它
                 result = future.result(timeout=result_timeout)
@@ -1323,7 +1324,7 @@ def main():
         worker = multiprocessing.Process(
             target=worker_process_loop,
             args=(TASK_QUEUE, RESULT_QUEUE),
-            daemon=True
+            daemon=False 
         )
         worker.start()
         
