@@ -1037,14 +1037,15 @@ def force_shutdown_endpoint():
 
 def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, upload_queue: multiprocessing.Queue, subtitle_config: dict, ai_models: dict):
     """
-    【修改后】媒体处理进程，不再负责删除整个任务目录，只负责生成待上传文件并派发任务。
+    【最终优化版】实现了智能并行策略。
+    先完成冲突的ffmpeg音频提取，然后让视频上传和字幕AI处理并行执行，以达到最高效率。
     """
     task_id = task_data['task_id']
     params = task_data['params']
     temp_dir = Path(f"/kaggle/working/task_{task_id}")
     temp_dir.mkdir(exist_ok=True)
     
-    # 内部状态跟踪
+    # ... [内部状态 _internal_status 和 _update_status 函数保持不变] ...
     _internal_status = {
         "progress": 0,
         "results": {
@@ -1053,7 +1054,6 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
         }
     }
 
-    # 状态更新回调函数
     def _update_status(component=None, status=None, details=None, progress_val=None, output=None, error_obj=None):
         payload = {'type': 'status_update', 'task_id': task_id, 'payload': {}}
         update_target = {}
@@ -1074,8 +1074,8 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
         if payload['payload']:
              result_queue.put(payload)
              
-    final_result_sent = False
     try:
+        # --- 步骤 1: 下载文件 ---
         _update_status(component="video", status="RUNNING", details="开始下载文件...", progress_val=5)
         _update_status(component="subtitle", status="RUNNING", details="等待视频下载...")
         file_url = params['url']
@@ -1093,9 +1093,31 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
                     if total_size > 0:
                         dl_progress = round((bytes_downloaded / total_size) * 100)
                         _update_status(component="video", details=f"下载中 ({dl_progress}%)...", progress_val=5 + int(dl_progress * 0.2))
+        
+        # --- 步骤 2: (如果需要) 串行执行有冲突的音频提取 ---
+        audio_chunks = None
+        if params["extract_subtitle"]:
+            mime_type, _ = mimetypes.guess_type(local_file_path)
+            if not (mime_type and mime_type.startswith("video")):
+                _update_status(component="subtitle", status="SKIPPED", details="源文件不是视频格式")
+            else:
+                try:
+                    _update_status(component="subtitle", status="RUNNING", details="正在提取音频 (ffmpeg)...", progress_val=30)
+                    # 这个函数的第一部分（ffmpeg调用）是阻塞的，会完成对视频文件的读取
+                    # 我们只调用预处理，不立即调用后续的AI pipeline
+                    def sub_progress_callback(stage, details): _update_status(component="subtitle", details=details)
+                    audio_chunks = preprocess_audio_for_subtitles(local_file_path, temp_dir, sub_progress_callback, ai_models)
+                except Exception as e:
+                    log_system_event("error", f"音频预处理失败: {e}", in_worker=True)
+                    _update_status(component="subtitle", status="FAILED", details=f"音频预处理失败: {e}", error_obj={"code": "AUDIO_EXTRACTION_FAILED", "message": str(e)})
+                    audio_chunks = None # 确保后续步骤不会执行
+        else:
+            _update_status(component="subtitle", status="SKIPPED", details="用户未请求提取")
 
+        # --- 步骤 3: 并行执行视频上传和字幕AI处理 ---
+        # 此时 ffmpeg 已结束，视频文件已释放，可以安全地开始上传
         if params["upload_video"]:
-            _update_status(component="video", status="RUNNING", details="已派发上传任务")
+            _update_status(component="video", status="RUNNING", details="已派发上传任务 (0%)...")
             upload_queue.put({
                 'task_id': task_id, 'component': 'video', 'local_file_path': str(local_file_path),
                 'filename_for_link': filename, 'api_client_base_url': task_data['api_client_base_url'],
@@ -1103,55 +1125,40 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
             })
         else:
             _update_status(component="video", status="SKIPPED", details="用户未请求上传")
-            
-        if params["extract_subtitle"]:
-            mime_type, _ = mimetypes.guess_type(local_file_path)
-            if not (mime_type and mime_type.startswith("video")):
-                _update_status(component="subtitle", status="SKIPPED", details="源文件不是视频格式")
-            else:
-                try:
-                    _update_status(component="subtitle", status="RUNNING", details="开始提取...", progress_val=35)
-                    def sub_progress_callback(stage, details): _update_status(component="subtitle", details=details)
-                    # 清理可能存在的旧音频块，但不删除主目录
-                    audio_chunks_dir = temp_dir / "audio_chunks"
-                    if audio_chunks_dir.exists():
-                        shutil.rmtree(audio_chunks_dir)
-                    
-                    audio_chunks = preprocess_audio_for_subtitles(local_file_path, temp_dir, sub_progress_callback, ai_models)
-                    srt_content = run_subtitle_extraction_pipeline(subtitle_config, audio_chunks, sub_progress_callback)
-                    
-                    if not srt_content: raise RuntimeError("未能生成有效的字幕内容。")
-                    
-                    srt_base64 = base64.b64encode(srt_content.encode('utf-8')).decode('utf-8')
-                    _update_status(component="subtitle", output={"contentBase64": srt_base64})
-                    
-                    if params["upload_subtitle"]:
-                        _update_status(component="subtitle", status="RUNNING", details="已派发字幕上传任务")
-                        srt_filename = local_file_path.stem + ".srt"
-                        srt_path = temp_dir / srt_filename
-                        with open(srt_path, "w", encoding="utf-8") as f: f.write(srt_content)
-                        upload_queue.put({
-                           'task_id': task_id, 'component': 'subtitle', 'local_file_path': str(srt_path),
-                           'filename_for_link': srt_filename, 'api_client_base_url': task_data['api_client_base_url'],
-                           'frp_server_addr': task_data['frp_server_addr']
-                        })
-                    else:
-                        _update_status(component="subtitle", status="SUCCESS", details="提取成功")
-                except Exception as e:
-                    _update_status(component="subtitle", status="FAILED", details=str(e), error_obj={"code": "TRANSCRIPTION_FAILED", "message": str(e)})
-        else:
-            _update_status(component="subtitle", status="SKIPPED", details="用户未请求提取")
+        
+        # 同时，如果音频块已成功提取，则开始进行耗时的AI处理
+        if audio_chunks is not None:
+            try:
+                _update_status(component="subtitle", status="RUNNING", details="AI处理中...", progress_val=40)
+                def sub_progress_callback(stage, details): _update_status(component="subtitle", details=details)
+                srt_content = run_subtitle_extraction_pipeline(subtitle_config, audio_chunks, sub_progress_callback)
+                
+                if not srt_content: raise RuntimeError("未能生成有效的字幕内容。")
+                
+                srt_base64 = base64.b64encode(srt_content.encode('utf-8')).decode('utf-8')
+                _update_status(component="subtitle", output={"contentBase64": srt_base64})
+                
+                if params["upload_subtitle"]:
+                    _update_status(component="subtitle", status="RUNNING", details="已派发字幕上传任务")
+                    srt_filename = local_file_path.stem + ".srt"
+                    srt_path = temp_dir / srt_filename
+                    with open(srt_path, "w", encoding="utf-8") as f: f.write(srt_content)
+                    upload_queue.put({
+                       'task_id': task_id, 'component': 'subtitle', 'local_file_path': str(srt_path),
+                       'filename_for_link': srt_filename, 'api_client_base_url': task_data['api_client_base_url'],
+                       'frp_server_addr': task_data['frp_server_addr']
+                    })
+                else:
+                    _update_status(component="subtitle", status="SUCCESS", details="提取成功")
+            except Exception as e:
+                _update_status(component="subtitle", status="FAILED", details=str(e), error_obj={"code": "TRANSCRIPTION_FAILED", "message": str(e)})
 
         log_system_event("info", f"媒体处理进程为任务 {task_id} 的主要工作已完成。", in_worker=True)
 
     except Exception as e:
         log_system_event("error", f"处理任务 {task_id} 时发生严重错误: {e}", in_worker=True)
         result_queue.put({'type': 'task_result', 'task_id': task_id, 'status': 'FAILED', 'result': {}, 'error': {"code": "FATAL_ERROR", "message": str(e)}})
-        final_result_sent = True
     finally:
-        # 【核心修改】
-        # 移除了这里的 shutil.rmtree(temp_dir, ignore_errors=True)
-        # 清理工作将由主进程中的 result_processor_thread 在确认任务完全结束后执行。
         log_system_event("info", f"媒体处理进程 {task_id} 完成，不再清理主任务目录。", in_worker=True)
 
 # =============================================================================
