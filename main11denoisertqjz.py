@@ -432,36 +432,27 @@ class ProxyManager:
             return []
 
     def _generate_node_config(self, node_url):
-        """【最终定稿版】严格参照标准配置文件，补全 fingerprint 等关键字段。"""
+        """【路由修复版】在配置中加入智能路由，区分代理流量和直连流量。"""
         try:
-            # 基础配置模板
-            config = {
-                "log": {"loglevel": "warning"},
-                "inbounds": [{
-                    "port": self.local_socks_port,
-                    "protocol": "socks",
-                    "listen": "127.0.0.1",
-                    "settings": {"auth": "noauth", "udp": True}
-                }],
-                "outbounds": [{"protocol": "freedom", "settings": {}}]
-            }
-            
             parsed_url = urlparse(node_url)
             node_name_raw = parsed_url.fragment
             node_name = unquote(node_name_raw) if node_name_raw else "Unnamed Node"
             
+            # --- 步骤 1: 构建 Outbounds ---
+            #
+            # Proxy Outbound (tag: "proxy")
             protocol = parsed_url.scheme
-            outbound = {"protocol": protocol, "settings": {}}
+            proxy_outbound = {"protocol": protocol, "settings": {}, "tag": "proxy"}
             
             if protocol == "vmess":
-                # ... (vmess 部分的逻辑保持不变) ...
+                # ... vmess 逻辑 (保持不变) ...
                 try:
                     decoded_vmess_str = base64.b64decode(parsed_url.netloc).decode('utf-8')
                     decoded_vmess = json.loads(decoded_vmess_str)
                 except Exception:
                      return None, f"Invalid VMess format for node {node_name}"
 
-                outbound["settings"]["vnext"] = [{
+                proxy_outbound["settings"]["vnext"] = [{
                     "address": decoded_vmess["add"],
                     "port": int(decoded_vmess["port"]),
                     "users": [{"id": decoded_vmess["id"], "alterId": int(decoded_vmess["aid"]), "security": decoded_vmess.get("scy", "auto")}]
@@ -476,73 +467,81 @@ class ProxyManager:
                 if decoded_vmess.get("tls", "") == "tls":
                      stream_settings["security"] = "tls"
                      stream_settings["tlsSettings"] = {"serverName": decoded_vmess.get("sni", decoded_vmess.get("host", decoded_vmess["add"]))}
-                outbound["streamSettings"] = stream_settings
+                proxy_outbound["streamSettings"] = stream_settings
 
             elif protocol == "vless":
+                # ... vless 逻辑 (保持不变) ...
                 qs = parse_qs(parsed_url.query)
-                
-                # 【核心修复 #1】构建一个更完整的 user 对象
-                user_obj = {
-                    "id": parsed_url.username,
-                    "encryption": "none",
-                    "flow": qs.get("flow", [None])[0],
-                    # 添加标准默认值以增强兼容性
-                    "alterId": 0,
-                    "security": "auto"
-                }
+                user_obj = { "id": parsed_url.username, "encryption": "none", "flow": qs.get("flow", [None])[0], "alterId": 0, "security": "auto" }
                 if user_obj["flow"] is None: del user_obj["flow"]
-                    
-                outbound["settings"]["vnext"] = [{
-                    "address": parsed_url.hostname,
-                    "port": int(parsed_url.port),
-                    "users": [user_obj]
-                }]
-                
+                proxy_outbound["settings"]["vnext"] = [{"address": parsed_url.hostname, "port": int(parsed_url.port), "users": [user_obj]}]
                 stream_settings = {"network": qs.get("type", ["tcp"])[0]}
-                
                 if stream_settings["network"] == "ws":
                     ws_path = unquote(qs.get("path", ["/"])[0])
                     ws_host = unquote(qs.get("host", [""])[0])
                     ws_settings = {"path": ws_path}
-                    if ws_host:
-                        ws_settings["headers"] = {"Host": ws_host}
+                    if ws_host: ws_settings["headers"] = {"Host": ws_host}
                     stream_settings["wsSettings"] = ws_settings
-                
                 if qs.get("security", ["none"])[0] == "tls":
                     stream_settings["security"] = "tls"
-                    
                     tls_sni = unquote(qs.get("sni", [""])[0]) or unquote(qs.get("host", [""])[0]) or parsed_url.hostname
-                    
-                    # 【核心修复 #2】添加 fingerprint 和其他 TLS 设置
-                    # 从查询参数中获取fingerprint，如果不存在则默认为 "random"
                     fp = qs.get("fp", ["random"])[0]
-
-                    tls_settings = {
-                        "serverName": tls_sni,
-                        "fingerprint": fp,
-                        "allowInsecure": False, # 默认为False以保证安全
-                        "show": False
-                    }
-                    
+                    tls_settings = {"serverName": tls_sni, "fingerprint": fp, "allowInsecure": False, "show": False}
                     alpn = qs.get("alpn")
-                    if alpn:
-                        tls_settings["alpn"] = [val for val in alpn[0].split(',') if val]
-
+                    if alpn: tls_settings["alpn"] = [val for val in alpn[0].split(',') if val]
                     stream_settings["tlsSettings"] = tls_settings
-
-                outbound["streamSettings"] = stream_settings
+                proxy_outbound["streamSettings"] = stream_settings
 
             else:
                 return None, f"Unsupported protocol: {protocol}"
 
-            config["outbounds"][0] = outbound
+            # Direct Outbound (tag: "direct")
+            direct_outbound = {"protocol": "freedom", "settings": {}, "tag": "direct"}
+            
+            # Block Outbound (tag: "block") - for ads, etc.
+            block_outbound = {"protocol": "blackhole", "settings": {}, "tag": "block"}
+
+            # --- 步骤 2: 构建最终配置 ---
+            config = {
+                "log": {"loglevel": "warning"},
+                "dns": { "servers": ["8.8.8.8", "1.1.1.1", "localhost"] },
+                "inbounds": [{
+                    "port": self.local_socks_port,
+                    "protocol": "socks",
+                    "listen": "127.0.0.1",
+                    "settings": {"auth": "noauth", "udp": True},
+                    "sniffing": { "enabled": True, "destOverride": ["http", "tls"] }
+                }],
+                "outbounds": [
+                    proxy_outbound,
+                    direct_outbound,
+                    block_outbound
+                ],
+                "routing": {
+                    "domainStrategy": "AsIs",
+                    "rules": [
+                        { # 规则1: 直连私有地址和本地地址
+                            "type": "field",
+                            "ip": ["geoip:private"],
+                            "outboundTag": "direct"
+                        },
+                        { # 规则2: (可选) 拦截广告
+                            "type": "field",
+                            "domain": ["geosite:category-ads-all"],
+                            "outboundTag": "block"
+                        },
+                        # 默认规则：其他所有流量都走代理
+                        # （Xray默认会将不匹配任何规则的流量发往第一个outbound，即proxy_outbound）
+                    ]
+                }
+            }
+            
             return config, node_name
         except Exception as e:
-            # 增加异常堆栈打印，便于调试
             import traceback
             traceback.print_exc()
             return None, f"Error parsing node '{node_name}': {e}"
-            
+
     def _test_node_upload_speed(self, node_config, node_name):
         """启动节点并测试其上传速度，返回MB/s。"""
         log_system_event("info", f"  -> 正在测试节点: {node_name}...")
