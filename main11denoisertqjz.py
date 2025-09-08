@@ -1026,13 +1026,14 @@ def force_shutdown_endpoint():
 
 def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, upload_queue: multiprocessing.Queue, subtitle_config: dict, ai_models: dict):
     """
-    媒体处理进程，派发上传任务后，只负责清理目录结构，且方式更健壮。
+    【修改后】媒体处理进程，不再负责删除整个任务目录，只负责生成待上传文件并派发任务。
     """
     task_id = task_data['task_id']
     params = task_data['params']
     temp_dir = Path(f"/kaggle/working/task_{task_id}")
     temp_dir.mkdir(exist_ok=True)
     
+    # 内部状态跟踪
     _internal_status = {
         "progress": 0,
         "results": {
@@ -1041,6 +1042,7 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
         }
     }
 
+    # 状态更新回调函数
     def _update_status(component=None, status=None, details=None, progress_val=None, output=None, error_obj=None):
         payload = {'type': 'status_update', 'task_id': task_id, 'payload': {}}
         update_target = {}
@@ -1099,11 +1101,19 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
                 try:
                     _update_status(component="subtitle", status="RUNNING", details="开始提取...", progress_val=35)
                     def sub_progress_callback(stage, details): _update_status(component="subtitle", details=details)
+                    # 清理可能存在的旧音频块，但不删除主目录
+                    audio_chunks_dir = temp_dir / "audio_chunks"
+                    if audio_chunks_dir.exists():
+                        shutil.rmtree(audio_chunks_dir)
+                    
                     audio_chunks = preprocess_audio_for_subtitles(local_file_path, temp_dir, sub_progress_callback, ai_models)
                     srt_content = run_subtitle_extraction_pipeline(subtitle_config, audio_chunks, sub_progress_callback)
+                    
                     if not srt_content: raise RuntimeError("未能生成有效的字幕内容。")
+                    
                     srt_base64 = base64.b64encode(srt_content.encode('utf-8')).decode('utf-8')
                     _update_status(component="subtitle", output={"contentBase64": srt_base64})
+                    
                     if params["upload_subtitle"]:
                         _update_status(component="subtitle", status="RUNNING", details="已派发字幕上传任务")
                         srt_filename = local_file_path.stem + ".srt"
@@ -1128,12 +1138,10 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
         result_queue.put({'type': 'task_result', 'task_id': task_id, 'status': 'FAILED', 'result': {}, 'error': {"code": "FATAL_ERROR", "message": str(e)}})
         final_result_sent = True
     finally:
-        # 【核心增强】移除 time.sleep，使用 ignore_errors=True 使清理更健壮
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            log_system_event("info", f"已清理任务 {task_id} 的临时目录结构。", in_worker=True)
-        except Exception as e:
-            log_system_event("error", f"清理任务 {task_id} 的临时目录结构失败: {e}", in_worker=True)
+        # 【核心修改】
+        # 移除了这里的 shutil.rmtree(temp_dir, ignore_errors=True)
+        # 清理工作将由主进程中的 result_processor_thread 在确认任务完全结束后执行。
+        log_system_event("info", f"媒体处理进程 {task_id} 完成，不再清理主任务目录。", in_worker=True)
 
 # =============================================================================
 # --- 第 8 步: 多进程 Worker 与主程序 ---
@@ -1147,7 +1155,7 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
 # 这个新函数专门负责文件上传，运行在独立的进程中
 def uploader_process_loop(upload_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue):
     """
-    一个专用的上传工作进程，增加了处理完文件后自我清理的功能。
+    一个专用的上传工作进程，增加了更详细的日志记录和容错，以排查静默失败问题。
     """
     log_system_event("info", "上传专用工作进程已启动。", in_worker=True)
     
@@ -1157,58 +1165,76 @@ def uploader_process_loop(upload_queue: multiprocessing.Queue, result_queue: mul
             if upload_task_data is None:
                 break
 
-            # 将文件路径取出，以便在 finally 中使用
             local_file_path_str = upload_task_data['local_file_path']
+            task_id = upload_task_data['task_id']
+            component = upload_task_data['component']
+
+            # --- 定义一个状态更新的快捷方式，即使在顶级异常中也能调用 ---
+            def _update_uploader_status(status, details=None, output=None, error_obj=None):
+                payload_results = {component: {}}
+                if status: payload_results[component]['status'] = status
+                if details: payload_results[component]['details'] = details
+                if output: payload_results[component]['output'] = output
+                if error_obj: payload_results[component]['error'] = error_obj
+                result_queue.put({'type': 'status_update', 'task_id': task_id, 'payload': {'results': payload_results}})
 
             try:
-                task_id = upload_task_data['task_id']
-                component = upload_task_data['component']
                 filename_for_link = upload_task_data['filename_for_link']
                 api_client_base_url = upload_task_data['api_client_base_url']
                 frp_server_addr = upload_task_data['frp_server_addr']
                 
                 api_client = MixFileCLIClient(base_url=api_client_base_url)
-                log_system_event("info", f"[上传进程] 开始上传 {component} 文件: {local_file_path_str}", in_worker=True)
+                log_system_event("info", f"[上传进程] [{component}] 开始处理上传任务，文件: {local_file_path_str}", in_worker=True)
+                
+                _update_uploader_status("RUNNING", details="正在上传...")
 
-                def _update_uploader_status(status, details=None, output=None, error_obj=None):
-                    payload_results = {component: {}}
-                    if status: payload_results[component]['status'] = status
-                    if details: payload_results[component]['details'] = details
-                    if output: payload_results[component]['output'] = output
-                    if error_obj: payload_results[component]['error'] = error_obj
-                    result_queue.put({'type': 'status_update', 'task_id': task_id, 'payload': {'results': payload_results}})
-
-                try:
-                    _update_uploader_status("RUNNING", details="正在上传...")
-                    response = api_client.upload_file(local_file_path_str)
-                    if isinstance(response, requests.Response) and response.ok:
+                # --- 增加详细日志和对 upload_file 调用的保护 ---
+                log_system_event("info", f"[上传进程] [{component}] 准备调用 api_client.upload_file", in_worker=True)
+                response = api_client.upload_file(local_file_path_str)
+                log_system_event("info", f"[上传进程] [{component}] api_client.upload_file 调用已返回", in_worker=True)
+                
+                # --- 对返回结果进行更严格的检查 ---
+                if isinstance(response, requests.Response):
+                    if response.ok:
                         share_code = response.text.strip()
                         share_url = f"http://{frp_server_addr}:{MIXFILE_REMOTE_PORT}/api/download/{quote(filename_for_link)}?s={share_code}"
                         _update_uploader_status("SUCCESS", details="上传成功", output={"shareUrl": share_url})
-                        log_system_event("info", f"[上传进程] {component} 上传成功。", in_worker=True)
+                        log_system_event("info", f"[上传进程] [{component}] 上传成功。", in_worker=True)
                     else:
-                        raise RuntimeError(f"上传失败: {response}")
-                except Exception as e:
-                    log_system_event("error", f"[上传进程] {component} 上传失败: {e}", in_worker=True)
-                    _update_uploader_status("FAILED", details=f"上传失败: {e}", error_obj={"code": "UPLOAD_FAILED", "message": str(e)})
+                        # HTTP 错误，但收到了 Response 对象
+                        error_msg = f"HTTP {response.status_code}: {response.text}"
+                        raise RuntimeError(error_msg)
+                elif isinstance(response, tuple):
+                    # _make_request 中捕获的 requests 异常
+                    error_msg = f"请求失败 (状态码 {response[0]}): {response[1]}"
+                    raise RuntimeError(error_msg)
+                else:
+                    # 未知返回类型
+                    error_msg = f"MixFile客户端返回了未知类型: {type(response)}"
+                    raise RuntimeError(error_msg)
+
+            except Exception as e:
+                # 捕获所有此任务的异常，确保一定能报告 FAILED 状态
+                log_system_event("error", f"[上传进程] [{component}] 上传任务发生严重错误: {e}", in_worker=True)
+                _update_uploader_status("FAILED", details=f"上传失败: {e}", error_obj={"code": "UPLOAD_FAILED", "message": str(e)})
 
             finally:
-                # 【核心增强】无论上传成功与否，都尝试删除本进程负责的这一个文件
+                # 文件清理逻辑保持不变
                 try:
                     local_file_path_obj = Path(local_file_path_str)
                     if local_file_path_obj.exists():
                         local_file_path_obj.unlink()
-                        log_system_event("info", f"[上传进程] 已清理文件: {local_file_path_str}", in_worker=True)
+                        log_system_event("info", f"[上传进程] [{component}] 已清理文件: {local_file_path_str}", in_worker=True)
                 except OSError as e:
-                    log_system_event("warning", f"[上传进程] 清理文件 {local_file_path_str} 失败: {e}", in_worker=True)
+                    log_system_event("warning", f"[上传进程] [{component}] 清理文件 {local_file_path_str} 失败: {e}", in_worker=True)
 
         except KeyboardInterrupt:
             break
         except Exception as e:
-            log_system_event("critical", f"上传专用工作进程发生严重错误: {e}", in_worker=True)
+            log_system_event("critical", f"上传专用工作进程发生致命错误，循环可能终止: {e}", in_worker=True)
             
     log_system_event("info", "上传专用工作进程已关闭。", in_worker=True)
-    
+       
 def worker_process_loop(task_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue, upload_queue: multiprocessing.Queue):
     """
     媒体处理工作进程循环，负责媒体处理并将上传任务外包。
@@ -1232,16 +1258,18 @@ def worker_process_loop(task_queue: multiprocessing.Queue, result_queue: multipr
 
 def result_processor_thread_loop(result_queue: multiprocessing.Queue):
     """
-    结果处理器，增加了最终状态判断和清理逻辑，使其更健壮。
+    【修改后】结果处理器，增加了在任务达到最终状态后，负责清理任务临时目录的逻辑。
     """
     log_system_event("info", "结果处理线程已启动。")
     while True:
         try:
+            # 使用长超时以防队列长时间空闲
             result_data = result_queue.get(timeout=3600)
             task_id = result_data['task_id']
 
             with tasks_lock:
-                if task_id not in tasks: continue
+                if task_id not in tasks:
+                    continue
 
                 task = tasks[task_id]
                 task['updatedAt'] = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
@@ -1256,23 +1284,27 @@ def result_processor_thread_loop(result_queue: multiprocessing.Queue):
                         for component, data in payload['results'].items():
                             if component in task['results']:
                                 task['results'][component].update(data)
+                    # 只要有更新，就认为是RUNNING（除非已经是最终状态）
                     if task['status'] not in ["SUCCESS", "FAILED", "PARTIAL_SUCCESS"]:
                          task['status'] = "RUNNING"
 
+                # --- 任务级结果（通常是严重错误） ---
                 elif data_type == 'task_result':
                     task['status'] = result_data.get('status', 'FAILED')
                     task['error'] = result_data.get('error')
                     task['progress'] = 100
                 
-                # 【核心增强】每次更新后都检查任务是否已达到最终状态
+                # --- 检查任务是否已达到最终状态 ---
                 video_status = task['results']['video']['status']
                 subtitle_status = task['results']['subtitle']['status']
                 
+                # 检查所有子组件是否都已脱离“处理中”的状态
                 is_finished = "PENDING" not in (video_status, subtitle_status) and \
                               "RUNNING" not in (video_status, subtitle_status)
 
+                # 如果任务已完成，并且尚未设置最终状态，则进行评估和清理
                 if is_finished and task['status'] not in ["SUCCESS", "FAILED", "PARTIAL_SUCCESS"]:
-                    log_system_event("info", f"任务 {task_id} 已达到最终状态，正在进行最终状态评估。")
+                    log_system_event("info", f"任务 {task_id} 所有组件已完成，正在进行最终状态评估。")
                     task['progress'] = 100
                     
                     # 状态清理：处理因进程崩溃导致的 "RUNNING" 残留状态
@@ -1287,7 +1319,7 @@ def result_processor_thread_loop(result_queue: multiprocessing.Queue):
                     final_video_status = task['results']['video']['status']
                     final_subtitle_status = task['results']['subtitle']['status']
                     
-                    # 定义真正参与评估的状态列表 (排除SKIPPED)
+                    # 定义参与最终状态评估的状态列表 (排除 SKIPPED)
                     active_statuses = [s for s in (final_video_status, final_subtitle_status) if s != "SKIPPED"]
                     
                     if not active_statuses: # 如果所有组件都被跳过
@@ -1299,15 +1331,26 @@ def result_processor_thread_loop(result_queue: multiprocessing.Queue):
                             task['status'] = "PARTIAL_SUCCESS"
                         else:
                             task['status'] = "FAILED"
-                    else:
-                        task['status'] = "SUCCESS" # 默认情况
+                    else: # 其他情况，例如全是SKIPPED和SUCCESS
+                        task['status'] = "SUCCESS"
 
                     log_system_event("info", f"任务 {task_id} 最终状态被设置为: {task['status']}")
 
+                    # 【核心新增】在此处执行清理操作
+                    temp_dir_to_clean = Path(f"/kaggle/working/task_{task_id}")
+                    if temp_dir_to_clean.exists():
+                        log_system_event("info", f"任务 {task_id} 已结束，准备清理临时目录: {temp_dir_to_clean}")
+                        try:
+                            shutil.rmtree(temp_dir_to_clean)
+                            log_system_event("info", f"✅ 成功清理任务 {task_id} 的临时目录。")
+                        except Exception as e:
+                            log_system_event("error", f"❌ 清理任务 {task_id} 的临时目录失败: {e}")
+
         except QueueEmpty:
+            # 队列为空是正常情况，继续循环
             continue
         except Exception as e:
-            log_system_event("error", f"结果处理线程发生错误: {e}")
+            log_system_event("error", f"结果处理线程发生严重错误: {e}")
             
 def main():
     #
