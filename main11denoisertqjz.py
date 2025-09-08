@@ -583,7 +583,7 @@ class ProxyManager:
             return None, None
 
         # 限制测速节点数量，避免任务启动过慢
-        nodes_to_test = random.sample(node_urls, min(len(node_urls), 3))
+        nodes_to_test = random.sample(node_urls, min(len(node_urls), 17))
         log_system_event("info", f"随机选择 {len(nodes_to_test)} 个节点进行测速...", in_worker=True)
 
         for node_url in nodes_to_test:
@@ -1420,7 +1420,7 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
         result_queue.put({'type': 'task_result', 'task_id': task_id, 'status': 'FAILED', 'result': {}, 'error': {"code": "FATAL_ERROR", "message": str(e)}})
     finally:
         log_system_event("info", f"媒体处理进程 {task_id} 完成，不再清理主任务目录。", in_worker=True)
-        
+
 # =============================================================================
 # --- 第 8 步: 多进程 Worker 与主程序 ---
 # =============================================================================
