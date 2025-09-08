@@ -538,37 +538,54 @@ class ProxyManager:
             traceback.print_exc()
             return None, f"Error parsing node '{node_name}': {e}"
 
-    def _test_upload_speed(self, test_url, proxies=None):
-        """测试上传速度的核心函数。返回速度(MB/s)。"""
+    def _test_upload_speed(self, test_upload_url, proxies=None):
+        """
+        【状态隔离修复版】测试上传速度的核心函数。
+        它接收一个完整的、包含唯一文件名的 URL 进行测试。
+        """
         try:
             # 使用较小的测试数据以加快测速过程
-            test_data_size = 1 * 1024 * 1024  # 1MB
+            test_data_size = 3 * 1024 * 1024  # 1MB
             test_data = os.urandom(test_data_size)
             
             start_time = time.time()
-            response = requests.put(test_url, data=test_data, proxies=proxies, timeout=30)
+            # 直接使用传入的、唯一的 URL
+            response = requests.put(test_upload_url, data=test_data, proxies=proxies, timeout=30)
             end_time = time.time()
             
-            response.raise_for_status()
+            response.raise_for_status() # 确保上传成功 (返回 2xx 状态码)
+
+            # 注意：我们不再尝试删除测速文件，因为它们的文件名是唯一的，
+            # 留存在服务器上不会对后续操作产生冲突。
+            # MixFileCLI 服务重启或手动清理即可。
+
             duration = end_time - start_time
             if duration > 0:
                 return (test_data_size / duration) / (1024 * 1024)  # MB/s
-        except Exception:
-            # 任何失败都意味着速度为0
+            else:
+                # 如果时间过短，给一个极高的速度值，而不是0，以表示连接非常快
+                return 999 
+        except Exception as e:
+            log_system_event("debug", f"测速失败 (proxy: {bool(proxies)}): {type(e).__name__}", in_worker=True)
             return 0
-        return 0
 
     def get_best_proxy_for_upload(self, api_client_base_url):
         """
-        执行完整的按需测速流程，并返回最优线路的proxies字典和其Xray配置。
-        如果所有代理都失败或比直连慢，则返回 (None, None)。
+        【状态隔离最终版】执行完整的按需测速流程。
+        为每一次独立的测速（包括直连）都生成一个唯一的上传URL，确保无状态冲突。
         """
         log_system_event("info", "====== 开始按需测速 ======", in_worker=True)
         self._ensure_xray_assets()
 
+        # --- 内部辅助函数，用于生成唯一的测试URL ---
+        def generate_unique_test_url():
+            random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+            test_filename = f"speed_test_{random_suffix}.tmp"
+            return urljoin(api_client_base_url, f"/api/upload/{quote(test_filename)}")
+
         # 1. 测试直连速度
-        test_upload_url = urljoin(api_client_base_url, "/api/upload/speed_test.tmp")
-        direct_speed = self._test_upload_speed(test_upload_url)
+        direct_test_url = generate_unique_test_url()
+        direct_speed = self._test_upload_speed(direct_test_url)
         log_system_event("info", f"  -> 直连速度: {direct_speed:.2f} MB/s", in_worker=True)
 
         best_node_config = None
@@ -582,8 +599,9 @@ class ProxyManager:
             log_system_event("info", "====== 测速结束 ======", in_worker=True)
             return None, None
 
-        # 限制测速节点数量，避免任务启动过慢
-        nodes_to_test = random.sample(node_urls, min(len(node_urls), 17))
+        # 限制测速节点数量
+        num_to_test = 3 if len(node_urls) > 3 else len(node_urls)
+        nodes_to_test = random.sample(node_urls, num_to_test)
         log_system_event("info", f"随机选择 {len(nodes_to_test)} 个节点进行测速...", in_worker=True)
 
         for node_url in nodes_to_test:
@@ -604,7 +622,10 @@ class ProxyManager:
                 continue
             
             proxies = {'http': f'socks5h://127.0.0.1:{self.local_socks_port}', 'https': f'socks5h://127.0.0.1:{self.local_socks_port}'}
-            node_speed = self._test_upload_speed(test_upload_url, proxies=proxies)
+            
+            # 【核心修改】为每个代理节点也生成唯一的测试URL
+            node_test_url = generate_unique_test_url()
+            node_speed = self._test_upload_speed(node_test_url, proxies=proxies)
             log_system_event("info", f"     节点 {node_name} 速度: {node_speed:.2f} MB/s", in_worker=True)
 
             if node_speed > best_node_speed:
@@ -614,7 +635,7 @@ class ProxyManager:
 
             process.terminate()
             process.wait()
-            time.sleep(1) # 确保端口已释放
+            time.sleep(1)
 
         log_system_event("info", "="*28, in_worker=True)
         log_system_event("info", f"  最优线路: {best_node_name}", in_worker=True)
@@ -623,12 +644,9 @@ class ProxyManager:
         log_system_event("info", "====== 测速结束 ======", in_worker=True)
 
         if best_node_config:
-            # 如果最优选择是代理节点，则返回其proxies字典和完整配置
             return {'http': f'socks5h://127.0.0.1:{self.local_socks_port}', 'https': f'socks5h://127.0.0.1:{self.local_socks_port}'}, best_node_config
         else:
-            # 如果最优选择是直连，则返回 (None, None)
             return None, None
-
 # =============================================================================
 # --- 第 4 步: 字幕提取核心模块 (在子进程中调用) ---
 # =============================================================================
