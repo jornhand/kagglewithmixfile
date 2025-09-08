@@ -831,7 +831,8 @@ class MixFileCLIClient:
             headers.update({'Cache-Control': 'no-cache', 'Pragma': 'no-cache'})
             kwargs['headers'] = headers
             
-            response = self.session.request(method, url, timeout=300, **kwargs)
+            # 使用更长的超时时间以适应慢速网络
+            response = self.session.request(method, url, timeout=600, **kwargs)
             response.raise_for_status()
             return response
         except requests.exceptions.RequestException as e:
@@ -844,7 +845,7 @@ class MixFileCLIClient:
 
     def upload_file(self, local_file_path: str, progress_callback: callable = None):
         #
-        # 上传单个文件并获取分享码。
+        # 【修改后】上传单个文件并获取分享码，增加了进度回调功能。
         #
         # Args:
         #     local_file_path (str): 本地文件的完整路径。
@@ -855,8 +856,14 @@ class MixFileCLIClient:
         #
         filename = os.path.basename(local_file_path)
         upload_url = urljoin(self.base_url, f"/api/upload/{quote(filename)}")
-        file_size = os.path.getsize(local_file_path)
+        
+        try:
+            file_size = os.path.getsize(local_file_path)
+        except OSError as e:
+             # 如果文件在这里就找不到了，直接返回错误
+            return (404, f"File not found: {e}")
 
+        # 【核心修改】创建一个生成器，它在读取文件的同时调用回调函数
         def file_reader_generator(file_handle):
             chunk_size = 1 * 1024 * 1024 # 1MB chunk
             bytes_read = 0
@@ -871,8 +878,12 @@ class MixFileCLIClient:
                     progress_callback(bytes_read, file_size)
                 yield chunk
 
-        with open(local_file_path, 'rb') as f:
-            return self._make_request("PUT", upload_url, data=file_reader_generator(f))
+        try:
+            with open(local_file_path, 'rb') as f:
+                # 将生成器作为 data 传递
+                return self._make_request("PUT", upload_url, data=file_reader_generator(f))
+        except FileNotFoundError as e:
+            return (404, str(e))
 
 # =============================================================================
 # --- 第 6 步: 统一的 Flask API 服务 (主进程) ---
@@ -1155,7 +1166,7 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
 # 这个新函数专门负责文件上传，运行在独立的进程中
 def uploader_process_loop(upload_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue):
     """
-    一个专用的上传工作进程，增加了更详细的日志记录和容错，以排查静默失败问题。
+    【修改后】一个专用的上传工作进程，增加了详细的进度报告功能，以解决静默挂起问题。
     """
     log_system_event("info", "上传专用工作进程已启动。", in_worker=True)
     
@@ -1165,11 +1176,11 @@ def uploader_process_loop(upload_queue: multiprocessing.Queue, result_queue: mul
             if upload_task_data is None:
                 break
 
-            local_file_path_str = upload_task_data['local_file_path']
             task_id = upload_task_data['task_id']
             component = upload_task_data['component']
+            local_file_path_str = upload_task_data['local_file_path']
 
-            # --- 定义一个状态更新的快捷方式，即使在顶级异常中也能调用 ---
+            # --- 定义一个状态更新的快捷方式 ---
             def _update_uploader_status(status, details=None, output=None, error_obj=None):
                 payload_results = {component: {}}
                 if status: payload_results[component]['status'] = status
@@ -1186,36 +1197,43 @@ def uploader_process_loop(upload_queue: multiprocessing.Queue, result_queue: mul
                 api_client = MixFileCLIClient(base_url=api_client_base_url)
                 log_system_event("info", f"[上传进程] [{component}] 开始处理上传任务，文件: {local_file_path_str}", in_worker=True)
                 
-                _update_uploader_status("RUNNING", details="正在上传...")
+                _update_uploader_status("RUNNING", details="正在上传 (0%)...")
 
-                # --- 增加详细日志和对 upload_file 调用的保护 ---
-                log_system_event("info", f"[上传进程] [{component}] 准备调用 api_client.upload_file", in_worker=True)
-                response = api_client.upload_file(local_file_path_str)
+                # 【核心修改】定义并使用进度回调
+                # 使用 nonlocal 关键字来修改外部作用域的变量
+                last_reported_percent = -1
+                def progress_callback(bytes_uploaded, total_bytes):
+                    nonlocal last_reported_percent
+                    if total_bytes > 0:
+                        percent = int((bytes_uploaded / total_bytes) * 100)
+                        # 每 5% 更新一次状态，避免消息过多，同时确保 100% 会被报告
+                        if percent > last_reported_percent and (percent % 5 == 0 or percent == 100):
+                            _update_uploader_status("RUNNING", details=f"正在上传 ({percent}%)")
+                            last_reported_percent = percent
+                
+                log_system_event("info", f"[上传进程] [{component}] 准备调用 api_client.upload_file (带进度回调)", in_worker=True)
+                # 将回调函数传递给 upload_file 方法
+                response = api_client.upload_file(local_file_path_str, progress_callback=progress_callback)
                 log_system_event("info", f"[上传进程] [{component}] api_client.upload_file 调用已返回", in_worker=True)
                 
-                # --- 对返回结果进行更严格的检查 ---
                 if isinstance(response, requests.Response):
                     if response.ok:
                         share_code = response.text.strip()
                         share_url = f"http://{frp_server_addr}:{MIXFILE_REMOTE_PORT}/api/download/{quote(filename_for_link)}?s={share_code}"
                         _update_uploader_status("SUCCESS", details="上传成功", output={"shareUrl": share_url})
-                        log_system_event("info", f"[上传进程] [{component}] 上传成功。", in_worker=True)
+                        log_system_event("info", f"✅ [上传进程] [{component}] 上传成功。", in_worker=True)
                     else:
-                        # HTTP 错误，但收到了 Response 对象
                         error_msg = f"HTTP {response.status_code}: {response.text}"
                         raise RuntimeError(error_msg)
                 elif isinstance(response, tuple):
-                    # _make_request 中捕获的 requests 异常
                     error_msg = f"请求失败 (状态码 {response[0]}): {response[1]}"
                     raise RuntimeError(error_msg)
                 else:
-                    # 未知返回类型
                     error_msg = f"MixFile客户端返回了未知类型: {type(response)}"
                     raise RuntimeError(error_msg)
 
             except Exception as e:
-                # 捕获所有此任务的异常，确保一定能报告 FAILED 状态
-                log_system_event("error", f"[上传进程] [{component}] 上传任务发生严重错误: {e}", in_worker=True)
+                log_system_event("error", f"❌ [上传进程] [{component}] 上传任务发生严重错误: {e}", in_worker=True)
                 _update_uploader_status("FAILED", details=f"上传失败: {e}", error_obj={"code": "UPLOAD_FAILED", "message": str(e)})
 
             finally:
@@ -1234,7 +1252,7 @@ def uploader_process_loop(upload_queue: multiprocessing.Queue, result_queue: mul
             log_system_event("critical", f"上传专用工作进程发生致命错误，循环可能终止: {e}", in_worker=True)
             
     log_system_event("info", "上传专用工作进程已关闭。", in_worker=True)
-       
+
 def worker_process_loop(task_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue, upload_queue: multiprocessing.Queue):
     """
     媒体处理工作进程循环，负责媒体处理并将上传任务外包。
@@ -1351,7 +1369,7 @@ def result_processor_thread_loop(result_queue: multiprocessing.Queue):
             continue
         except Exception as e:
             log_system_event("error", f"结果处理线程发生严重错误: {e}")
-            
+
 def main():
     #
     # 主执行函数，负责初始化和启动所有服务。
