@@ -388,73 +388,61 @@ def _shutdown_notebook_kernel_immediately():
 
 class ProxyManager:
     """
-    负责下载、测试和管理 V2Ray/Xray 代理客户端，以加速文件上传。
+    【重构版】按需为上传任务寻找最优代理线路的工具类。
+    它被设计为在工作进程中按需实例化和使用，不管理常驻后台进程。
     """
-    def __init__(self, sub_url, mixfile_base_url):
+    def __init__(self, sub_url=None):
         self.sub_url = sub_url
-        self.mixfile_base_url = mixfile_base_url
-        self.v2ray_path = Path("/kaggle/working/xray")
+        self.xray_path = Path("/kaggle/working/xray")
         self.config_path = Path("/kaggle/working/xray_config.json")
         self.local_socks_port = 10808
-        self.best_node_config = None
-        self.best_node_speed = 0  # in MB/s
+        self.geoip_path = Path("/kaggle/working/geoip.dat")
+        self.geosite_path = Path("/kaggle/working/geosite.dat")
 
-    def _download_xray(self):
-        """【依赖修复版】下载 Xray 核心的同时，也下载其路由所需的 geoip.dat 和 geosite.dat 文件。"""
-        geoip_path = Path("/kaggle/working/geoip.dat")
-        geosite_path = Path("/kaggle/working/geosite.dat")
-
-        # 检查核心和数据库文件是否都存在
-        if self.v2ray_path.exists() and geoip_path.exists() and geosite_path.exists():
-            log_system_event("info", "Xray 核心及数据库文件已存在，跳过下载。")
+    def _ensure_xray_assets(self):
+        """确保 Xray 核心及数据库文件已下载。"""
+        if self.xray_path.exists() and self.geoip_path.exists() and self.geosite_path.exists():
             return
-        
-        log_system_event("info", "正在下载 Xray 核心及数据库文件...")
-        
-        # 定义下载URL
+
+        log_system_event("info", "检测到Xray组件缺失，正在下载...", in_worker=True)
         xray_url = "https://github.com/XTLS/Xray-core/releases/download/v1.8.10/Xray-linux-64.zip"
         geoip_url = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
         geosite_url = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
-        
         zip_path = Path("/kaggle/working/xray.zip")
         
         try:
-            # 下载 Xray 核心
-            if not self.v2ray_path.exists():
-                log_system_event("info", "  -> 下载 Xray core...")
+            if not self.xray_path.exists():
+                log_system_event("info", "  -> 下载 Xray core...", in_worker=True)
                 run_command(f"wget -q -O {zip_path} {xray_url}").wait()
                 run_command(f"unzip -o {zip_path} xray -d /kaggle/working/").wait()
-                self.v2ray_path.chmod(0o755)
+                self.xray_path.chmod(0o755)
                 zip_path.unlink()
-
-            # 下载 geoip.dat
-            if not geoip_path.exists():
-                log_system_event("info", "  -> 下载 geoip.dat...")
-                run_command(f"wget -q -O {geoip_path} {geoip_url}").wait()
-            
-            # 下载 geosite.dat
-            if not geosite_path.exists():
-                log_system_event("info", "  -> 下载 geosite.dat...")
-                run_command(f"wget -q -O {geosite_path} {geosite_url}").wait()
-
-            log_system_event("info", "✅ Xray 核心及数据库文件下载完成。")
+            if not self.geoip_path.exists():
+                log_system_event("info", "  -> 下载 geoip.dat...", in_worker=True)
+                run_command(f"wget -q -O {self.geoip_path} {geoip_url}").wait()
+            if not self.geosite_path.exists():
+                log_system_event("info", "  -> 下载 geosite.dat...", in_worker=True)
+                run_command(f"wget -q -O {self.geosite_path} {geosite_url}").wait()
+            log_system_event("info", "✅ Xray组件下载完成。", in_worker=True)
         except Exception as e:
             raise RuntimeError(f"下载 Xray 组件失败: {e}")
 
     def _fetch_and_parse_subscription(self):
         """获取并解析订阅链接，返回节点链接列表。"""
-        log_system_event("info", f"正在从 {self.sub_url[:30]}... 获取订阅...")
+        if not self.sub_url:
+            return []
+        log_system_event("info", f"正在从 {self.sub_url[:30]}... 获取订阅...", in_worker=True)
         try:
             response = requests.get(self.sub_url, timeout=20)
             response.raise_for_status()
             decoded_content = base64.b64decode(response.content).decode('utf-8')
             return decoded_content.strip().split('\n')
         except Exception as e:
-            log_system_event("error", f"获取或解析订阅失败: {e}")
+            log_system_event("error", f"获取或解析订阅失败: {e}", in_worker=True)
             return []
 
     def _generate_node_config(self, node_url):
-        """【路由修复版】在配置中加入智能路由，区分代理流量和直连流量。"""
+        """根据节点URL生成Xray的JSON配置（包含路由）。"""
         try:
             parsed_url = urlparse(node_url)
             node_name_raw = parsed_url.fragment
@@ -467,7 +455,6 @@ class ProxyManager:
             proxy_outbound = {"protocol": protocol, "settings": {}, "tag": "proxy"}
             
             if protocol == "vmess":
-                # ... vmess 逻辑 (保持不变) ...
                 try:
                     decoded_vmess_str = base64.b64decode(parsed_url.netloc).decode('utf-8')
                     decoded_vmess = json.loads(decoded_vmess_str)
@@ -492,7 +479,6 @@ class ProxyManager:
                 proxy_outbound["streamSettings"] = stream_settings
 
             elif protocol == "vless":
-                # ... vless 逻辑 (保持不变) ...
                 qs = parse_qs(parsed_url.query)
                 user_obj = { "id": parsed_url.username, "encryption": "none", "flow": qs.get("flow", [None])[0], "alterId": 0, "security": "auto" }
                 if user_obj["flow"] is None: del user_obj["flow"]
@@ -513,7 +499,6 @@ class ProxyManager:
                     if alpn: tls_settings["alpn"] = [val for val in alpn[0].split(',') if val]
                     stream_settings["tlsSettings"] = tls_settings
                 proxy_outbound["streamSettings"] = stream_settings
-
             else:
                 return None, f"Unsupported protocol: {protocol}"
 
@@ -542,117 +527,108 @@ class ProxyManager:
                 "routing": {
                     "domainStrategy": "AsIs",
                     "rules": [
-                        { # 规则1: 直连私有地址和本地地址
-                            "type": "field",
-                            "ip": ["geoip:private"],
-                            "outboundTag": "direct"
-                        },
-                        { # 规则2: (可选) 拦截广告
-                            "type": "field",
-                            "domain": ["geosite:category-ads-all"],
-                            "outboundTag": "block"
-                        },
-                        # 默认规则：其他所有流量都走代理
-                        # （Xray默认会将不匹配任何规则的流量发往第一个outbound，即proxy_outbound）
+                        { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" },
+                        { "type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block" },
                     ]
                 }
             }
-            
             return config, node_name
         except Exception as e:
             import traceback
             traceback.print_exc()
             return None, f"Error parsing node '{node_name}': {e}"
 
-    def _test_node_upload_speed(self, node_config, node_name):
-        """启动节点并测试其上传速度，返回MB/s。"""
-        log_system_event("info", f"  -> 正在测试节点: {node_name}...")
-        with open(self.config_path, 'w') as f:
-            json.dump(node_config, f)
-        
-        process = run_command(f"{self.v2ray_path} -c {self.config_path}")
-        if not wait_for_port(self.local_socks_port, timeout=10):
-            log_system_event("warning", f"     节点 {node_name} 启动失败。")
-            process.terminate()
-            process.wait()
-            return 0
-
-        speed = 0
+    def _test_upload_speed(self, test_url, proxies=None):
+        """测试上传速度的核心函数。返回速度(MB/s)。"""
         try:
-            proxies = {
-                'http': f'socks5h://127.0.0.1:{self.local_socks_port}',
-                'https': f'socks5h://127.0.0.1:{self.local_socks_port}',
-            }
-            # 创建一个 2MB 的随机文件用于测试
-            test_data_size = 5 * 1024 * 1024
-            test_data = ''.join(random.choices(string.ascii_letters + string.digits, k=test_data_size)).encode()
-            
-            test_upload_url = urljoin(self.mixfile_base_url, "/api/upload/proxy_test.tmp")
+            # 使用较小的测试数据以加快测速过程
+            test_data_size = 1 * 1024 * 1024  # 1MB
+            test_data = os.urandom(test_data_size)
             
             start_time = time.time()
-            # 注意：这里的测试目标是MixFile服务，确保测试的是真实上传链路
-            response = requests.put(test_upload_url, data=test_data, proxies=proxies, timeout=60)
+            response = requests.put(test_url, data=test_data, proxies=proxies, timeout=30)
             end_time = time.time()
             
             response.raise_for_status()
-            
             duration = end_time - start_time
-            speed = (test_data_size / duration) / (1024 * 1024) # MB/s
-            log_system_event("info", f"     ✅ 节点 {node_name} 可用，上传速度: {speed:.2f} MB/s")
-        except Exception as e:
-            log_system_event("warning", f"     ❌ 节点 {node_name} 测试失败: {e}")
-        finally:
+            if duration > 0:
+                return (test_data_size / duration) / (1024 * 1024)  # MB/s
+        except Exception:
+            # 任何失败都意味着速度为0
+            return 0
+        return 0
+
+    def get_best_proxy_for_upload(self, api_client_base_url):
+        """
+        执行完整的按需测速流程，并返回最优线路的proxies字典和其Xray配置。
+        如果所有代理都失败或比直连慢，则返回 (None, None)。
+        """
+        log_system_event("info", "====== 开始按需测速 ======", in_worker=True)
+        self._ensure_xray_assets()
+
+        # 1. 测试直连速度
+        test_upload_url = urljoin(api_client_base_url, "/api/upload/speed_test.tmp")
+        direct_speed = self._test_upload_speed(test_upload_url)
+        log_system_event("info", f"  -> 直连速度: {direct_speed:.2f} MB/s", in_worker=True)
+
+        best_node_config = None
+        best_node_speed = direct_speed
+        best_node_name = "Direct Connection"
+
+        # 2. 循环测试所有代理节点
+        node_urls = self._fetch_and_parse_subscription()
+        if not node_urls:
+            log_system_event("warning", "未获取到代理节点，将使用直连。", in_worker=True)
+            log_system_event("info", "====== 测速结束 ======", in_worker=True)
+            return None, None
+
+        # 限制测速节点数量，避免任务启动过慢
+        nodes_to_test = random.sample(node_urls, min(len(node_urls), 3))
+        log_system_event("info", f"随机选择 {len(nodes_to_test)} 个节点进行测速...", in_worker=True)
+
+        for node_url in nodes_to_test:
+            node_config, node_name = self._generate_node_config(node_url.strip())
+            if not node_config: 
+                log_system_event("warning", f"解析节点失败，跳过: {node_name}", in_worker=True)
+                continue
+
+            log_system_event("info", f"  -> 正在测试节点: {node_name}...", in_worker=True)
+            with open(self.config_path, 'w') as f:
+                json.dump(node_config, f)
+            
+            process = run_command(f"{self.xray_path} -c {self.config_path}")
+            if not wait_for_port(self.local_socks_port, host='127.0.0.1', timeout=10):
+                log_system_event("warning", f"     节点 {node_name} 启动失败。", in_worker=True)
+                process.terminate()
+                process.wait()
+                continue
+            
+            proxies = {'http': f'socks5h://127.0.0.1:{self.local_socks_port}', 'https': f'socks5h://127.0.0.1:{self.local_socks_port}'}
+            node_speed = self._test_upload_speed(test_upload_url, proxies=proxies)
+            log_system_event("info", f"     节点 {node_name} 速度: {node_speed:.2f} MB/s", in_worker=True)
+
+            if node_speed > best_node_speed:
+                best_node_speed = node_speed
+                best_node_config = node_config
+                best_node_name = node_name
+
             process.terminate()
             process.wait()
             time.sleep(1) # 确保端口已释放
-        return speed
 
-    def setup_best_proxy(self):
-        """主流程：寻找并启动最快的代理节点。"""
-        global GLOBAL_PROXY_SETTINGS
-        try:
-            self._download_xray()
-            node_urls = self._fetch_and_parse_subscription()
-            if not node_urls:
-                log_system_event("warning", "未获取到任何代理节点，将不使用代理。")
-                return
+        log_system_event("info", "="*28, in_worker=True)
+        log_system_event("info", f"  最优线路: {best_node_name}", in_worker=True)
+        log_system_event("info", f"  最高速度: {best_node_speed:.2f} MB/s", in_worker=True)
+        log_system_event("info", "="*28, in_worker=True)
+        log_system_event("info", "====== 测速结束 ======", in_worker=True)
 
-            log_system_event("info", f"获取到 {len(node_urls)} 个节点，开始测速...")
+        if best_node_config:
+            # 如果最优选择是代理节点，则返回其proxies字典和完整配置
+            return {'http': f'socks5h://127.0.0.1:{self.local_socks_port}', 'https': f'socks5h://127.0.0.1:{self.local_socks_port}'}, best_node_config
+        else:
+            # 如果最优选择是直连，则返回 (None, None)
+            return None, None
             
-            for node_url in node_urls:
-                node_config, node_name = self._generate_node_config(node_url.strip())
-                if not node_config:
-                    log_system_event("debug", f"跳过不支持的节点或解析失败: {node_name}")
-                    continue
-                
-                speed = self._test_node_upload_speed(node_config, node_name)
-                if speed > self.best_node_speed:
-                    self.best_node_speed = speed
-                    self.best_node_config = node_config
-            
-            if self.best_node_config:
-                log_system_event("info", "="*60)
-                log_system_event("info", f"🚀 最快节点选择完成！速度: {self.best_node_speed:.2f} MB/s")
-                log_system_event("info", "正在后台启动此节点用于后续所有上传任务...")
-                log_system_event("info", "="*60)
-
-                with open(self.config_path, 'w') as f:
-                    json.dump(self.best_node_config, f)
-                
-                run_command(f"{self.v2ray_path} -c {self.config_path}", "xray.log")
-                if not wait_for_port(self.local_socks_port, timeout=10):
-                    raise RuntimeError("启动最优代理节点失败！")
-                
-                GLOBAL_PROXY_SETTINGS = {
-                    'http': f'socks5h://127.0.0.1:{self.local_socks_port}',
-                    'https': f'socks5h://127.0.0.1:{self.local_socks_port}',
-                }
-            else:
-                log_system_event("warning", "所有节点均测试失败，本次运行将不使用代理。")
-
-        except Exception as e:
-            log_system_event("error", f"设置代理时发生严重错误: {e}。将不使用代理。")
-
 # =============================================================================
 # --- 第 4 步: 字幕提取核心模块 (在子进程中调用) ---
 # =============================================================================
@@ -1469,93 +1445,131 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
 # 这个新函数专门负责文件上传，运行在独立的进程中
 def uploader_process_loop(upload_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue):
     """
-    【修改后】一个专用的上传工作进程，增加了详细的进度报告功能，以解决静默挂起问题。
+    【重构版】上传工作进程，实现按任务(task_id)进行一次性的按需测速和代理管理。
     """
     log_system_event("info", "上传专用工作进程已启动。", in_worker=True)
-    
-    while True:
-        try:
-            upload_task_data = upload_queue.get()
-            if upload_task_data is None:
-                break
+    task_proxy_cache = {}  # key: task_id, value: {'proxies': ..., 'config': ...}
 
-            task_id = upload_task_data['task_id']
-            component = upload_task_data['component']
-            local_file_path_str = upload_task_data['local_file_path']
+    # 在循环外初始化一次 ProxyManager
+    proxy_manager = ProxyManager(subtitle_config_global.get("V2RAY_SUB_URL"))
+    xray_process = None
 
-            # --- 定义一个状态更新的快捷方式 ---
-            def _update_uploader_status(status, details=None, output=None, error_obj=None):
-                payload_results = {component: {}}
-                if status: payload_results[component]['status'] = status
-                if details: payload_results[component]['details'] = details
-                if output: payload_results[component]['output'] = output
-                if error_obj: payload_results[component]['error'] = error_obj
-                result_queue.put({'type': 'status_update', 'task_id': task_id, 'payload': {'results': payload_results}})
+    def start_xray_for_task(config):
+        nonlocal xray_process
+        if xray_process:
+            xray_process.terminate()
+            xray_process.wait()
+        
+        config_path = Path("/kaggle/working/xray_final_config.json")
+        with open(config_path, 'w') as f:
+            json.dump(config, f)
+        
+        xray_process = run_command(f"{proxy_manager.xray_path} -c {config_path}", "xray_upload.log")
+        if not wait_for_port(proxy_manager.local_socks_port, host='127.0.0.1', timeout=10):
+            log_system_event("error", "启动最优代理节点用于上传失败！", in_worker=True)
+            return False
+        return True
 
+    try:
+        while True:
             try:
-                filename_for_link = upload_task_data['filename_for_link']
+                upload_task_data = upload_queue.get()
+                if upload_task_data is None:
+                    break
+
+                task_id = upload_task_data['task_id']
+                component = upload_task_data['component']
+                local_file_path_str = upload_task_data['local_file_path']
                 api_client_base_url = upload_task_data['api_client_base_url']
-                frp_server_addr = upload_task_data['frp_server_addr']
                 
-                # api_client = MixFileCLIClient(base_url=api_client_base_url)
-                api_client = MixFileCLIClient(base_url=api_client_base_url, proxies=GLOBAL_PROXY_SETTINGS)
-                log_system_event("info", f"[上传进程] [{component}] 开始处理上传任务，文件: {local_file_path_str}", in_worker=True)
-                
-                _update_uploader_status("RUNNING", details="正在上传 (0%)...")
+                # --- 按需测速与代理选择 ---
+                if task_id not in task_proxy_cache:
+                    proxies_for_task, config_for_task = proxy_manager.get_best_proxy_for_upload(api_client_base_url)
+                    task_proxy_cache[task_id] = {'proxies': proxies_for_task, 'config': config_for_task}
+                    
+                    if config_for_task:
+                        if not start_xray_for_task(config_for_task):
+                            # 启动失败，本次任务回退到直连
+                            task_proxy_cache[task_id]['proxies'] = None
+                    elif xray_process: # 如果之前有代理在运行，但这次是直连，则关闭它
+                        xray_process.terminate()
+                        xray_process.wait()
+                        xray_process = None
 
-                # 【核心修改】定义并使用进度回调
-                # 使用 nonlocal 关键字来修改外部作用域的变量
-                last_reported_percent = -1
-                def progress_callback(bytes_uploaded, total_bytes):
-                    nonlocal last_reported_percent
-                    if total_bytes > 0:
-                        percent = int((bytes_uploaded / total_bytes) * 100)
-                        # 每 5% 更新一次状态，避免消息过多，同时确保 100% 会被报告
-                        if percent > last_reported_percent and (percent % 5 == 0 or percent == 100):
-                            _update_uploader_status("RUNNING", details=f"正在上传 ({percent}%)")
-                            last_reported_percent = percent
+                current_proxies = task_proxy_cache[task_id]['proxies']
                 
-                log_system_event("info", f"[上传进程] [{component}] 准备调用 api_client.upload_file (带进度回调)", in_worker=True)
-                # 将回调函数传递给 upload_file 方法
-                response = api_client.upload_file(local_file_path_str, progress_callback=progress_callback)
-                log_system_event("info", f"[上传进程] [{component}] api_client.upload_file 调用已返回", in_worker=True)
-                
-                if isinstance(response, requests.Response):
-                    if response.ok:
-                        share_code = response.text.strip()
-                        share_url = f"http://{frp_server_addr}:{MIXFILE_REMOTE_PORT}/api/download/{quote(filename_for_link)}?s={share_code}"
-                        _update_uploader_status("SUCCESS", details="上传成功", output={"shareUrl": share_url})
-                        log_system_event("info", f"✅ [上传进程] [{component}] 上传成功。", in_worker=True)
-                    else:
-                        error_msg = f"HTTP {response.status_code}: {response.text}"
-                        raise RuntimeError(error_msg)
-                elif isinstance(response, tuple):
-                    error_msg = f"请求失败 (状态码 {response[0]}): {response[1]}"
-                    raise RuntimeError(error_msg)
-                else:
-                    error_msg = f"MixFile客户端返回了未知类型: {type(response)}"
-                    raise RuntimeError(error_msg)
+                # ... (后续的上传逻辑，从 _update_uploader_status 定义开始，保持不变) ...
+                def _update_uploader_status(status, details=None, output=None, error_obj=None):
+                    payload_results = {component: {}}
+                    if status: payload_results[component]['status'] = status
+                    if details: payload_results[component]['details'] = details
+                    if output: payload_results[component]['output'] = output
+                    if error_obj: payload_results[component]['error'] = error_obj
+                    result_queue.put({'type': 'status_update', 'task_id': task_id, 'payload': {'results': payload_results}})
 
-            except Exception as e:
-                log_system_event("error", f"❌ [上传进程] [{component}] 上传任务发生严重错误: {e}", in_worker=True)
-                _update_uploader_status("FAILED", details=f"上传失败: {e}", error_obj={"code": "UPLOAD_FAILED", "message": str(e)})
-
-            finally:
-                # 文件清理逻辑保持不变
                 try:
-                    local_file_path_obj = Path(local_file_path_str)
-                    if local_file_path_obj.exists():
-                        local_file_path_obj.unlink()
-                        log_system_event("info", f"[上传进程] [{component}] 已清理文件: {local_file_path_str}", in_worker=True)
-                except OSError as e:
-                    log_system_event("warning", f"[上传进程] [{component}] 清理文件 {local_file_path_str} 失败: {e}", in_worker=True)
+                    filename_for_link = upload_task_data['filename_for_link']
+                    frp_server_addr = upload_task_data['frp_server_addr']
+                    
+                    # 使用当前任务缓存的代理配置创建客户端
+                    api_client = MixFileCLIClient(base_url=api_client_base_url, proxies=current_proxies)
+                    log_system_event("info", f"[上传进程] [{component}] 开始处理上传任务 (代理: {'启用' if current_proxies else '禁用'})...", in_worker=True)
 
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            log_system_event("critical", f"上传专用工作进程发生致命错误，循环可能终止: {e}", in_worker=True)
-            
-    log_system_event("info", "上传专用工作进程已关闭。", in_worker=True)
+                    _update_uploader_status("RUNNING", details="正在上传 (0%)...")
+                    
+                    last_reported_percent = -1
+                    def progress_callback(bytes_uploaded, total_bytes):
+                        nonlocal last_reported_percent
+                        if total_bytes > 0:
+                            percent = int((bytes_uploaded / total_bytes) * 100)
+                            if percent > last_reported_percent and (percent % 5 == 0 or percent == 100):
+                                _update_uploader_status("RUNNING", details=f"正在上传 ({percent}%)")
+                                last_reported_percent = percent
+                    
+                    response = api_client.upload_file(local_file_path_str, progress_callback=progress_callback)
+                    
+                    if isinstance(response, requests.Response):
+                        if response.ok:
+                            share_code = response.text.strip()
+                            share_url = f"http://{frp_server_addr}:{MIXFILE_REMOTE_PORT}/api/download/{quote(filename_for_link)}?s={share_code}"
+                            _update_uploader_status("SUCCESS", details="上传成功", output={"shareUrl": share_url})
+                            log_system_event("info", f"✅ [上传进程] [{component}] 上传成功。", in_worker=True)
+                        else:
+                            raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
+                    elif isinstance(response, tuple):
+                        raise RuntimeError(f"请求失败 (状态码 {response[0]}): {response[1]}")
+                    else:
+                        raise RuntimeError(f"MixFile客户端返回了未知类型: {type(response)}")
+
+                except Exception as e:
+                    log_system_event("error", f"❌ [上传进程] [{component}] 上传任务发生严重错误: {e}", in_worker=True)
+                    _update_uploader_status("FAILED", details=f"上传失败: {e}", error_obj={"code": "UPLOAD_FAILED", "message": str(e)})
+
+                finally:
+                    try:
+                        Path(local_file_path_str).unlink(missing_ok=True)
+                    except OSError as e:
+                        log_system_event("warning", f"[上传进程] [{component}] 清理文件 {local_file_path_str} 失败: {e}", in_worker=True)
+                    
+                    # 检查是否是该任务的最后一个上传组件，如果是，则清理缓存
+                    # 这是一个简单的检查，可以根据需要做得更复杂
+                    if component == 'subtitle': # 假设字幕总是最后一个
+                        log_system_event("info", f"任务 {task_id} 上传完成，清理代理缓存。", in_worker=True)
+                        del task_proxy_cache[task_id]
+                        if xray_process:
+                           xray_process.terminate()
+                           xray_process.wait()
+                           xray_process = None
+
+            except QueueEmpty:
+                continue
+            except Exception as e:
+                log_system_event("critical", f"上传专用工作进程循环发生内部错误: {e}", in_worker=True)
+    finally:
+        if xray_process:
+            xray_process.terminate()
+            xray_process.wait()
+        log_system_event("info", "上传专用工作进程已关闭。", in_worker=True)
 
 def worker_process_loop(task_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue, upload_queue: multiprocessing.Queue):
     """
@@ -1726,14 +1740,6 @@ def main():
         run_command("java -jar mixfile-cli.jar", "mixfile.log")
         if not wait_for_port(MIXFILE_LOCAL_PORT):
             raise RuntimeError("MixFileCLI 服务启动失败，请检查 mixfile.log。")
-
-        # 【核心新增】--- 4.5 启动并配置最优代理 ---
-        v2ray_sub_url = subtitle_config_global.get("V2RAY_SUB_URL")
-        if v2ray_sub_url:
-            proxy_manager = ProxyManager(sub_url=v2ray_sub_url, mixfile_base_url=api_client_base_url)
-            proxy_manager.setup_best_proxy()
-        else:
-            log_system_event("info", "未在配置中找到 V2RAY_SUB_URL，不启用代理功能。")
 
         # --- 5. 初始化多进程队列和工作进程 ---
         TASK_QUEUE = multiprocessing.Queue()
