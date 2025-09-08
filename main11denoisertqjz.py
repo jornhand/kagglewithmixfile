@@ -631,13 +631,13 @@ def _process_subtitle_batch_with_ai(
 
         # 3. 发送请求并实现全面的重试逻辑
         log_system_event("info", f"[字幕任务 {group_index+1}] 数据准备完毕，正在调用 Gemini API...", in_worker=True)
-        max_retries = 4
+        max_retries = 3
         last_exception = None
         
         for attempt in range(max_retries):
             try:
                 # 使用稍长的超时时间，因为可能包含大量音频数据
-                response = requests.post(generate_url, headers=headers, json=payload, timeout=480) 
+                response = requests.post(generate_url, headers=headers, json=payload, timeout=300) 
                 
                 # 可重试的服务器端错误
                 if response.status_code in [429, 500, 503, 504]:
@@ -895,6 +895,9 @@ RESULT_QUEUE = None # 多进程结果队列
 
 # --- B. API 路由定义 ---
 
+# =============================================================================
+# --- (方法1/3) unified_upload_endpoint [修改后] ---
+# =============================================================================
 @app.route("/api/upload", methods=["POST"])
 def unified_upload_endpoint():
     #
@@ -908,7 +911,7 @@ def unified_upload_endpoint():
 
     task_id = str(uuid.uuid4())
     
-    # 从请求中提取参数，并设置默认值
+    # 从请求中提取参数
     request_params = {
         "url": data["url"],
         "extract_subtitle": data.get("extract_subtitle", False),
@@ -916,34 +919,48 @@ def unified_upload_endpoint():
         "upload_subtitle": data.get("upload_subtitle", False),
     }
 
-    # 初始化任务状态
+    # 【核心修改】初始化新的、面板友好的任务状态结构
     with tasks_lock:
         tasks[task_id] = {
-            "task_id": task_id,
-            "status": "pending",
-            "stage": "queue",
-            "details": "任务已创建，等待处理",
+            "taskId": task_id,
+            "status": "QUEUED",
             "progress": 0,
-            "result": None
+            "error": None,
+            "results": {
+                "video": {
+                    "status": "PENDING" if request_params["upload_video"] else "SKIPPED",
+                    "details": "等待处理" if request_params["upload_video"] else "用户未请求此操作",
+                    "output": None,
+                    "error": None
+                },
+                "subtitle": {
+                    "status": "PENDING" if request_params["extract_subtitle"] else "SKIPPED",
+                    "details": "等待处理" if request_params["extract_subtitle"] else "用户未请求此操作",
+                    "output": None,
+                    "error": None
+                }
+            },
+            "createdAt": time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
+            "updatedAt": time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
         }
 
-    # 【核心修改】将任务数据放入队列，由子进程处理
+    # 将任务数据放入队列，由子进程处理
     task_data = {
         'task_id': task_id,
         'params': request_params,
-        'subtitle_config': subtitle_config_global, # 传递必要的配置
+        'subtitle_config': subtitle_config_global,
         'api_client_base_url': api_client.base_url,
-        'frp_server_addr': FRP_SERVER_ADDR # 传递FRP地址用于构建链接
+        'frp_server_addr': FRP_SERVER_ADDR
     }
     TASK_QUEUE.put(task_data)
     
     log_system_event("info", f"已创建新任务 {task_id} 并推入处理队列。")
 
+    # 返回体保持不变，依然简洁
     return jsonify({
         "task_id": task_id,
         "status_url": f"/api/tasks/{task_id}"
     }), 202
-
 
 @app.route("/api/tasks/<task_id>", methods=["GET"])
 def get_task_status_endpoint(task_id):
@@ -1009,8 +1026,7 @@ def force_shutdown_endpoint():
 
 def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, ai_models: dict):
     #
-    # 处理一个完整的媒体任务，包含下载、字幕提取和上传等步骤。
-    # 这个函数实现了方案2的核心逻辑：子任务的独立失败处理。
+    # 处理一个完整的媒体任务，适配新的面板友好型API输出。
     #
     
     # --- 1. 初始化 ---
@@ -1020,179 +1036,159 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, a
     api_client_base_url = task_data['api_client_base_url']
     frp_server_addr = task_data['frp_server_addr']
     
-    # 在子进程中重新创建api_client
     local_api_client = MixFileCLIClient(base_url=api_client_base_url)
-
     temp_dir = Path(f"/kaggle/working/task_{task_id}")
     temp_dir.mkdir(exist_ok=True)
-    
-    # 定义一个内部函数来更新任务状态，通过队列发送给主进程
-    def _update_status(status, stage, details, progress=None):
-        update_data = {
-            'type': 'status_update',
-            'task_id': task_id,
-            'payload': {
-                'status': status,
-                'stage': stage,
-                'details': details,
-            }
-        }
-        if progress is not None:
-            update_data['payload']['progress'] = progress
-        result_queue.put(update_data)
 
-    
-    # 初始化最终结果结构
-    final_result = {
-        "video_file": {"status": "pending"},
-        "subtitle_file": {"status": "pending"}
+    # 内部状态，用于追踪各组件情况
+    _internal_status = {
+        "progress": 0,
+        "results": {
+            "video": {"status": "PENDING", "details": "准备中", "output": None, "error": None},
+            "subtitle": {"status": "PENDING", "details": "准备中", "output": None, "error": None}
+        }
     }
 
+    # 定义一个新的、更强大的状态更新函数
+    def _update_status(component=None, status=None, details=None, progress_val=None, output=None, error_obj=None):
+        payload = {'type': 'status_update', 'task_id': task_id, 'payload': {}}
+        
+        if component and component in _internal_status["results"]:
+            if status: _internal_status["results"][component]["status"] = status
+            if details: _internal_status["results"][component]["details"] = details
+            if output:
+                if _internal_status["results"][component]["output"] is None:
+                    _internal_status["results"][component]["output"] = {}
+                _internal_status["results"][component]["output"].update(output)
+            if error_obj: _internal_status["results"][component]["error"] = error_obj
+        
+        if progress_val is not None:
+            _internal_status["progress"] = progress_val
+        
+        payload['payload'] = {
+            "progress": _internal_status["progress"],
+            "results": _internal_status["results"]
+        }
+        result_queue.put(payload)
+
+    # 主任务逻辑
     try:
-        # --- 2. 子任务: 下载源文件 ---
-        _update_status("running", "download", "准备从 URL 下载文件...", 0)
+        # --- 2. 下载源文件 ---
+        _update_status(component="video", status="RUNNING", details="开始下载文件...", progress_val=5)
+        _update_status(component="subtitle", status="RUNNING", details="等待视频下载...")
         
         file_url = params['url']
-        # 从URL猜测文件名，并进行清理
-        filename_encoded = file_url.split("/")[-1].split("?")[0] or f"downloaded_file_{task_id}"
-        filename = unquote(filename_encoded)
+        filename = unquote(file_url.split("/")[-1].split("?")[0] or f"file_{task_id}")
         local_file_path = temp_dir / filename
-        final_result["video_file"]["filename"] = filename
 
-        bytes_downloaded = 0
         with requests.get(file_url, stream=True, timeout=60) as r:
             r.raise_for_status()
             total_size = int(r.headers.get('content-length', 0))
+            bytes_downloaded = 0
             with open(local_file_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
                     bytes_downloaded += len(chunk)
                     if total_size > 0:
-                        progress = round((bytes_downloaded / total_size) * 100, 2)
-                        _update_status("running", "download", f"已下载 {bytes_downloaded}/{total_size} 字节", progress)
-        
-        # --- 3. 子任务: 媒体类型验证 ---
-        _update_status("running", "validate", "正在验证文件类型...", 100)
-        is_video = False
+                        dl_progress = round((bytes_downloaded / total_size) * 100)
+                        _update_status(component="video", details=f"下载中 ({dl_progress}%)...", progress_val=5 + int(dl_progress * 0.2)) # 下载占总进度20%
+
+        # --- 3. 验证与分发任务 ---
         mime_type, _ = mimetypes.guess_type(local_file_path)
-        if mime_type and mime_type.startswith("video"):
-            is_video = True
-            log_system_event("info", f"文件 {filename} 被识别为视频 ({mime_type})。", in_worker=True)
-        else:
-            log_system_event("warning", f"文件 {filename} 不是标准视频格式 ({mime_type})。", in_worker=True)
+        is_video = bool(mime_type and mime_type.startswith("video"))
 
-        # --- 4. 子任务: 字幕提取 ---
-        srt_content = None
-        if params["extract_subtitle"]:
-            if is_video:
-                try:
-                    _update_status("running", "subtitle_extraction", "字幕提取流程已启动...", 0)
-                    # 调用完整的字幕提取管道
-                    # 创建一个局部lambda，因为它不能被pickle传递
-                    update_callback_for_sub = lambda stage, details: _update_status("running", stage, details)
-                    audio_chunks = preprocess_audio_for_subtitles(local_file_path, temp_dir, update_callback_for_sub, ai_models)
-                    srt_content = run_subtitle_extraction_pipeline(subtitle_config, audio_chunks, update_callback_for_sub)
-                    if srt_content:
-                        srt_filename = local_file_path.stem + ".srt"
-                        final_result["subtitle_file"]["filename"] = srt_filename
-                        final_result["subtitle_file"]["status"] = "success"
-                        
-                        # 返回Base64编码的SRT文件
-                        srt_base64 = base64.b64encode(srt_content.encode('utf-8')).decode('utf-8')
-                        final_result["subtitle_file"]["content_base64"] = srt_base64
-                        
-                        # 将SRT文件保存到本地以备上传
-                        with open(temp_dir / srt_filename, "w", encoding="utf-8") as f:
-                            f.write(srt_content)
-                    else:
-                        raise RuntimeError("未检测到有效语音，无法生成字幕。")
-
-                except Exception as e:
-                    log_system_event("error", f"任务 {task_id} 的字幕提取失败: {e}", in_worker=True)
-                    final_result["subtitle_file"]["status"] = "failed"
-                    final_result["subtitle_file"]["details"] = f"字幕提取失败: {str(e)}"
-            else:
-                final_result["subtitle_file"]["status"] = "skipped"
-                final_result["subtitle_file"]["details"] = "源文件不是有效的视频格式"
-        else:
-            final_result["subtitle_file"]["status"] = "skipped"
-            final_result["subtitle_file"]["details"] = "未请求提取字幕"
-
-        # --- 5. 子任务: 文件上传 (使用并发) ---
-        _update_status("running", "uploading", "准备上传文件到 MixFile...", 0)
-        
-        upload_tasks = []
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            # 提交视频上传任务
-            if params["upload_video"]:
-                upload_tasks.append(executor.submit(local_api_client.upload_file, str(local_file_path)))
-            else:
-                final_result["video_file"]["status"] = "skipped"
-
-            # 提交字幕上传任务
-            if params["upload_subtitle"] and srt_content:
-                srt_path = temp_dir / final_result["subtitle_file"]["filename"]
-                upload_tasks.append(executor.submit(local_api_client.upload_file, str(srt_path)))
-        
-        # 处理上传结果
-        for future in upload_tasks:
+        # 定义两个核心子任务
+        def video_upload_task():
+            if not params["upload_video"]:
+                _update_status(component="video", status="SKIPPED", details="用户未请求上传")
+                return
             try:
-                # 假设 upload_file 成功时返回 Response，失败时返回 tuple
-                response = future.result()
-                
-                is_srt_upload = False
-                if hasattr(response, 'request') and response.request is not None and response.request.url is not None:
-                     if ".srt" in unquote(response.request.url):
-                        is_srt_upload = True
-
+                _update_status(component="video", status="RUNNING", details="准备上传...", progress_val=30)
+                response = local_api_client.upload_file(str(local_file_path))
                 if isinstance(response, requests.Response) and response.ok:
                     share_code = response.text.strip()
-                    if is_srt_upload:
-                        target_result = final_result["subtitle_file"]
-                    else:
-                        target_result = final_result["video_file"]
-                    
-                    target_result["status"] = "success"
-                    target_result["share_code"] = share_code
-                    target_result["share_link"] = f"http://{frp_server_addr}:{MIXFILE_REMOTE_PORT}/api/download/{quote(target_result['filename'])}?s={share_code}"
+                    share_url = f"http://{frp_server_addr}:{MIXFILE_REMOTE_PORT}/api/download/{quote(filename)}?s={share_code}"
+                    _update_status(component="video", status="SUCCESS", details="上传成功", output={"shareUrl": share_url})
                 else:
-                    status_code, error_text = response if isinstance(response, tuple) else (response.status_code, response.text)
-                    raise RuntimeError(f"上传失败。状态码: {status_code}, 错误: {error_text}")
-
+                    raise RuntimeError(f"上传失败: {response}")
             except Exception as e:
-                log_system_event("error", f"任务 {task_id} 的文件上传失败: {e}", in_worker=True)
-                if final_result["video_file"]["status"] == "pending":
-                    final_result["video_file"]["status"] = "failed"
-                    final_result["video_file"]["details"] = str(e)
-                if final_result["subtitle_file"].get("status") == "success" and "share_code" not in final_result["subtitle_file"]:
-                    final_result["subtitle_file"]["status"] = "upload_failed"
-                    final_result["subtitle_file"]["details"] = str(e)
+                _update_status(component="video", status="FAILED", details=str(e), error_obj={"code": "UPLOAD_FAILED", "message": str(e)})
 
-        # --- 6. 任务完成 ---
-        result_data = {
+        def subtitle_task():
+            if not params["extract_subtitle"]:
+                _update_status(component="subtitle", status="SKIPPED", details="用户未请求提取")
+                return
+            if not is_video:
+                _update_status(component="subtitle", status="SKIPPED", details="源文件不是视频格式")
+                return
+            try:
+                _update_status(component="subtitle", status="RUNNING", details="开始提取...", progress_val=35)
+                
+                def sub_progress_callback(stage, details):
+                    _update_status(component="subtitle", details=details)
+
+                audio_chunks = preprocess_audio_for_subtitles(local_file_path, temp_dir, sub_progress_callback, ai_models)
+                srt_content = run_subtitle_extraction_pipeline(subtitle_config, audio_chunks, sub_progress_callback)
+                
+                if not srt_content:
+                    raise RuntimeError("未能生成有效的字幕内容。")
+
+                srt_base64 = base64.b64encode(srt_content.encode('utf-8')).decode('utf-8')
+                _update_status(component="subtitle", output={"contentBase64": srt_base64})
+                
+                if params["upload_subtitle"]:
+                    _update_status(component="subtitle", details="准备上传字幕...")
+                    srt_filename = local_file_path.stem + ".srt"
+                    srt_path = temp_dir / srt_filename
+                    with open(srt_path, "w", encoding="utf-8") as f: f.write(srt_content)
+                    
+                    response = local_api_client.upload_file(str(srt_path))
+                    if isinstance(response, requests.Response) and response.ok:
+                        share_code = response.text.strip()
+                        share_url = f"http://{frp_server_addr}:{MIXFILE_REMOTE_PORT}/api/download/{quote(srt_filename)}?s={share_code}"
+                        _update_status(component="subtitle", status="SUCCESS", details="提取和上传成功", output={"shareUrl": share_url})
+                    else:
+                        raise RuntimeError(f"字幕上传失败: {response}")
+                else:
+                    _update_status(component="subtitle", status="SUCCESS", details="提取成功")
+            except Exception as e:
+                _update_status(component="subtitle", status="FAILED", details=str(e), error_obj={"code": "TRANSCRIPTION_FAILED", "message": str(e)})
+
+        # 使用线程池并发执行两个子任务
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            executor.submit(video_upload_task)
+            executor.submit(subtitle_task)
+
+        # --- 4. 任务完成 ---
+        final_video_status = _internal_status["results"]["video"]["status"]
+        final_subtitle_status = _internal_status["results"]["subtitle"]["status"]
+        
+        final_status = "SUCCESS"
+        if "FAILED" in [final_video_status, final_subtitle_status]:
+            if "SUCCESS" in [final_video_status, final_subtitle_status]:
+                final_status = "PARTIAL_SUCCESS"
+            else:
+                final_status = "FAILED"
+        
+        result_queue.put({
             'type': 'task_result',
             'task_id': task_id,
-            'status': 'success',
-            'result': final_result,
-            'details': '任务处理完成'
-        }
-        result_queue.put(result_data)
-            
+            'status': final_status,
+            'result': _internal_status["results"]
+        })
+
     except Exception as e:
         log_system_event("error", f"处理任务 {task_id} 时发生严重错误: {e}", in_worker=True)
-        result_data = {
+        result_queue.put({
             'type': 'task_result',
             'task_id': task_id,
-            'status': 'failed',
-            'result': final_result, # 即使失败也返回部分结果
-            'details': str(e)
-        }
-        result_queue.put(result_data)
+            'status': 'FAILED',
+            'result': _internal_status["results"],
+            'error': {"code": "INTERNAL_SERVER_ERROR", "message": str(e)}
+        })
     finally:
-        # --- 7. 清理临时文件 ---
         try:
             shutil.rmtree(temp_dir)
-            log_system_event("info", f"已清理任务 {task_id} 的临时目录。", in_worker=True)
         except Exception as e:
             log_system_event("error", f"清理任务 {task_id} 的临时目录失败: {e}", in_worker=True)
 
@@ -1234,28 +1230,35 @@ def result_processor_thread_loop(result_queue: multiprocessing.Queue):
     log_system_event("info", "结果处理线程已启动。")
     while True:
         try:
-            # 使用带超时的get，防止永久阻塞，允许未来加入优雅退出逻辑
             result_data = result_queue.get(timeout=3600) 
             
             task_id = result_data['task_id']
             with tasks_lock:
                 if task_id not in tasks:
-                    continue # 如果任务已被清除，则忽略
+                    continue
 
+                # 更新时间戳
+                tasks[task_id]['updatedAt'] = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
+                
                 data_type = result_data['type']
                 if data_type == 'status_update':
-                    payload = result_data['payload']
-                    tasks[task_id].update(payload)
+                    payload = result_data.get('payload', {})
+                    # 【核心修改】直接更新 progress 和 results
+                    if 'progress' in payload:
+                        tasks[task_id]['progress'] = payload['progress']
+                    if 'results' in payload:
+                        tasks[task_id]['results'] = payload['results']
+                    tasks[task_id]['status'] = "RUNNING" # 只要是update，就是running状态
 
                 elif data_type == 'task_result':
-                    tasks[task_id]['status'] = result_data['status']
-                    tasks[task_id]['result'] = result_data['result']
-                    tasks[task_id]['details'] = result_data['details']
+                    tasks[task_id]['status'] = result_data.get('status', 'FAILED')
+                    tasks[task_id]['results'] = result_data.get('result', {})
+                    tasks[task_id]['error'] = result_data.get('error')
                     tasks[task_id]['progress'] = 100
-                    log_system_event("info", f"任务 {task_id} 已完成，状态: {result_data['status']}.")
+                    log_system_event("info", f"任务 {task_id} 已完成，最终状态: {tasks[task_id]['status']}.")
         
         except QueueEmpty:
-            continue # 超时是正常情况，继续循环
+            continue
         except Exception as e:
             log_system_event("error", f"结果处理线程发生错误: {e}")
 
