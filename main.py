@@ -43,7 +43,6 @@ from queue import Empty as QueueEmpty
 # --- Web 框架与 HTTP 客户端 ---
 from flask import Flask, request, jsonify, Response
 import requests
-import speedtest
 
 
 
@@ -586,18 +585,10 @@ class ProxyManager:
             random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
             test_filename = f"speed_test_{random_suffix}.tmp"
             return urljoin(api_client_base_url, f"/api/upload/{quote(test_filename)}")
-        print("正在测试下载速度...")
-        wifi = speedtest.Speedtest()
-        download_speed = wifi.download() / 1_000_000  # 转换为Mbps
-        print(f"下载速度: {download_speed:.2f} Mbps")
 
-        print("正在测试上传速度...")
-        upload_speed = wifi.upload() / 1_000_000  # 转换为Mbps
-        print(f"上传速度: {upload_speed:.2f} Mbps")     
         # 1. 测试直连速度
         direct_test_url = generate_unique_test_url()
         direct_speed = self._test_upload_speed(direct_test_url)
-  
         log_system_event("info", f"  -> 直连速度: {direct_speed:.2f} MB/s", in_worker=True)
 
         best_node_config = None
@@ -1889,7 +1880,7 @@ def main():
         
         install_torch_cmd = (
             "pip uninstall -y torch torchvision torchaudio && "
-            "pip install speedtest-cli torch==2.3.0 torchaudio==2.3.0 --index-url https://download.pytorch.org/whl/cu121"
+            "pip install torch==2.3.0 torchaudio==2.3.0 --index-url https://download.pytorch.org/whl/cu121"
         )
         log_system_event("info", "正在安装兼容的 PyTorch 版本...")
         install_proc = subprocess.run(install_torch_cmd, shell=True, capture_output=True, text=True)
@@ -1897,8 +1888,8 @@ def main():
             log_system_event("error", f"PyTorch 安装失败！\nStdout: {install_proc.stdout}\nStderr: {install_proc.stderr}")
             raise RuntimeError("未能安装兼容的 PyTorch 版本。")
         log_system_event("info", "✅ 兼容的 PyTorch 安装完成。")
-        install_other_cmd = "pip install -q pydantic pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai requests psutil"
         
+        install_other_cmd = "pip install -q pydantic pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai requests psutil"
         log_system_event("info", "正在安装其余依赖库...")
         subprocess.run(install_other_cmd, shell=True, check=True)
         log_system_event("info", "✅ 其余依赖库安装完成。")
