@@ -1196,8 +1196,7 @@ RESULT_QUEUE = None # 多进程结果队列
 def unified_upload_endpoint():
     #
     # 统一的媒体处理入口 API。
-    # 接收一个 URL，并根据参数决定是上传文件、提取字幕，还是两者都做。
-    # 始终以异步模式运行。
+    # 【修改后】增加了将请求参数存入任务字典的逻辑，以支持动态进度计算。
     #
     data = request.get_json()
     if not data or "url" not in data:
@@ -1213,7 +1212,7 @@ def unified_upload_endpoint():
         "upload_subtitle": data.get("upload_subtitle", False),
     }
 
-    # 【核心修改】初始化新的、面板友好的任务状态结构
+    # 初始化任务状态结构
     with tasks_lock:
         tasks[task_id] = {
             "taskId": task_id,
@@ -1234,6 +1233,10 @@ def unified_upload_endpoint():
                     "error": None
                 }
             },
+            # --- START OF MODIFICATION ---
+            # 约定一个内部键来存储原始参数，供进度模型使用
+            "_internal_params": request_params,
+            # --- END OF MODIFICATION ---
             "createdAt": time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
             "updatedAt": time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
         }
@@ -1250,12 +1253,12 @@ def unified_upload_endpoint():
     
     log_system_event("info", f"已创建新任务 {task_id} 并推入处理队列。")
 
-    # 返回体保持不变，依然简洁
+    # 返回体保持不变
     return jsonify({
         "task_id": task_id,
         "status_url": f"/api/tasks/{task_id}"
     }), 202
-
+    
 # --- (将下面的函数完整替换掉原来的版本) ---
 @app.route("/api/tasks/<task_id>", methods=["GET"])
 def get_task_status_endpoint(task_id):
@@ -1378,27 +1381,90 @@ def force_shutdown_endpoint():
 # =============================================================================
 # --- 第 7 步: 高容错的统一任务处理器 (在子进程中运行) ---
 # =============================================================================
-
+# 删了哦就安全了
 def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, upload_queue: multiprocessing.Queue, subtitle_config: dict, ai_models: dict):
     """
-    【并行优化最终版】将ffmpeg提取音频与后续处理拆分，实现视频上传与音频处理的最大化并行。
+    【进度计算优化最终版】实现基于权重的动态进度更新模型，并确保逻辑健壮性。
     """
     task_id = task_data['task_id']
     params = task_data['params']
     temp_dir = Path(f"/kaggle/working/task_{task_id}")
     temp_dir.mkdir(exist_ok=True)
     
-    # ... [内部状态 _internal_status 和 _update_status 函数保持不变] ...
+    # ================== START: 新增进度模型 ==================
+    
+    # 步骤 1: 定义各阶段的权重
+    # 总权重为 100，根据您的业务逻辑，您可以调整这些值。
+    # 这里我们假设视频上传和字幕提取是耗时最长的主要部分。
+    PROGRESS_WEIGHTS = {
+        'download': 20,
+        'video_upload': 40,
+        'subtitle_pipeline': 40, # 包含了音频提取、AI处理、字幕上传
+    }
+    
+    # 过滤掉未被请求的阶段，并重新计算总权重
+    active_weights = {}
+    if params.get("upload_video", True):
+        active_weights['video_upload'] = PROGRESS_WEIGHTS['video_upload']
+    
+    if params.get("extract_subtitle", False):
+        active_weights['subtitle_pipeline'] = PROGRESS_WEIGHTS['subtitle_pipeline']
+
+    # 下载是必要前置步骤（除非没有需要处理的内容）
+    if active_weights:
+        active_weights['download'] = PROGRESS_WEIGHTS['download']
+
+    total_active_weight = sum(active_weights.values())
+
+    # 如果没有任何活动阶段 (例如，只请求了字幕上传但没请求提取)，总进度直接为100
+    if total_active_weight == 0:
+        total_active_weight = 100 
+    
+    completed_weight = 0
+
+    # 步骤 2: 创建一个新的、更强大的进度更新函数
+    def _calculate_and_update_progress(current_stage: str, stage_progress_percent: float = 0.0):
+        """
+        根据当前阶段和其内部进度，计算总体进度。
+        :param current_stage: 当前正在进行的阶段的key (e.g., 'download')
+        :param stage_progress_percent: 当前阶段自身的完成百分比 (0.0 to 1.0)
+        """
+        nonlocal completed_weight
+        
+        current_stage_weight = active_weights.get(current_stage, 0)
+        
+        # 计算当前进行中阶段贡献的进度
+        current_progress_from_stage = current_stage_weight * stage_progress_percent
+        
+        # 总进度 = 已完成阶段的总权重 + 当前阶段贡献的进度
+        total_progress = (completed_weight + current_progress_from_stage)
+        
+        # 将总进度按总活动权重进行归一化
+        normalized_progress = int((total_progress / total_active_weight) * 100) if total_active_weight > 0 else 100
+        
+        # 更新状态，只发送 progress_val
+        result_queue.put({'type': 'status_update', 'task_id': task_id, 'payload': {'progress': normalized_progress}})
+        
+    def _mark_stage_as_completed(stage_key: str):
+        """标记一个阶段已完成，并将其权重累加到 completed_weight。"""
+        nonlocal completed_weight
+        if stage_key in active_weights:
+            completed_weight += active_weights[stage_key]
+        
+        # 更新一次总进度，确保达到该阶段的上限
+        _calculate_and_update_progress(stage_key, 1.0)
+        
+    # =================== END: 新增进度模型 ===================
+
     _internal_status = {
-        "progress": 0,
         "results": {
             "video": {"status": "PENDING", "details": "准备中", "output": None, "error": None},
             "subtitle": {"status": "PENDING", "details": "准备中", "output": None, "error": None}
         }
     }
-    def _update_status(component=None, status=None, details=None, progress_val=None, output=None, error_obj=None):
+    # 旧的 _update_status 现在只负责更新组件状态，不再处理总进度
+    def _update_status(component=None, status=None, details=None, output=None, error_obj=None):
         payload = {'type': 'status_update', 'task_id': task_id, 'payload': {}}
-        update_target = {}
         if component and component in _internal_status["results"]:
             update_target = _internal_status["results"][component]
             partial_update = {}
@@ -1410,52 +1476,58 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
                 partial_update['output'] = update_target['output']
             if error_obj: update_target["error"] = error_obj; partial_update['error'] = error_obj
             payload['payload']['results'] = {component: partial_update}
-        if progress_val is not None:
-            _internal_status["progress"] = progress_val
-            payload['payload']['progress'] = _internal_status['progress']
         if payload['payload']:
              result_queue.put(payload)
-
     try:
-        # --- 步骤 1: 下载文件 ---
-        _update_status(component="video", status="RUNNING", details="开始下载文件...", progress_val=5)
-        _update_status(component="subtitle", status="RUNNING", details="等待视频下载...")
-        file_url = params['url']
-        filename = unquote(file_url.split("/")[-1].split("?")[0] or f"file_{task_id}")
-        local_file_path = temp_dir / filename
-        with requests.get(file_url, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            total_size = int(r.headers.get('content-length', 0))
-            bytes_downloaded = 0
-            with open(local_file_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-                    bytes_downloaded += len(chunk)
-                    if total_size > 0:
-                        dl_progress = round((bytes_downloaded / total_size) * 100)
-                        _update_status(component="video", details=f"下载中 ({dl_progress}%)...", progress_val=5 + int(dl_progress * 0.2))
-        _update_status(component="video", details="下载完成")
+        # --- 步骤 1 (下载文件)，使用新的进度更新逻辑 ---
+        if 'download' in active_weights:
+            _update_status(component="video", status="RUNNING", details="开始下载文件...")
+            _update_status(component="subtitle", status="RUNNING", details="等待视频下载...")
+            file_url = params['url']
+            filename = unquote(file_url.split("/")[-1].split("?")[0] or f"file_{task_id}")
+            local_file_path = temp_dir / filename
+            with requests.get(file_url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                total_size = int(r.headers.get('content-length', 0))
+                bytes_downloaded = 0
+                with open(local_file_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        bytes_downloaded += len(chunk)
+                        if total_size > 0:
+                            dl_percent = bytes_downloaded / total_size
+                            _update_status(component="video", details=f"下载中 ({int(dl_percent*100)}%)...")
+                            # 调用新的进度计算函数
+                            _calculate_and_update_progress('download', dl_percent)
+            _update_status(component="video", details="下载完成")
+            _mark_stage_as_completed('download')
+        else:
+             local_file_path = None # 如果没有下载阶段，确保这个变量存在
 
-        # --- 步骤 2: (如果需要) 串行执行冲突的 ffmpeg 音频提取 ---
+        # --- 步骤 2 (音频提取) - 这部分算作 'subtitle_pipeline' 的一部分 ---
         raw_audio_path_for_subtitle = None
         if params["extract_subtitle"]:
-            mime_type, _ = mimetypes.guess_type(local_file_path)
+            mime_type, _ = mimetypes.guess_type(local_file_path) if local_file_path and local_file_path.exists() else (None, None)
             if not (mime_type and mime_type.startswith("video")):
                 _update_status(component="subtitle", status="SKIPPED", details="源文件不是视频格式")
+                # 如果跳过，字幕管线的权重就不算了（或者在这里特殊处理）
+                _mark_stage_as_completed('subtitle_pipeline')
             else:
                 try:
+                    # 音频提取是字幕流程的第一步，给它分配10%的字幕管线进度
+                    _calculate_and_update_progress('subtitle_pipeline', 0.10) 
                     def sub_progress_callback(stage, details): _update_status(component="subtitle", details=details)
-                    # 只执行第一步提取，完成后视频文件即被释放
                     raw_audio_path_for_subtitle = extract_audio_with_ffmpeg(local_file_path, temp_dir, sub_progress_callback)
                 except Exception as e:
                     _update_status(component="subtitle", status="FAILED", details=f"音频提取失败: {e}", error_obj={"code": "AUDIO_EXTRACTION_FAILED", "message": str(e)})
+                    _mark_stage_as_completed('subtitle_pipeline') # 失败也算阶段结束
         else:
             _update_status(component="subtitle", status="SKIPPED", details="用户未请求提取")
 
-        # --- 步骤 3: 并行执行视频上传和后续音频处理 ---
-        # 此时 ffmpeg 已结束，视频文件已释放，可以安全地派发上传任务
+        # --- 步骤 3 (并行派发任务) ---
         if params["upload_video"]:
-            _update_status(component="video", status="RUNNING", details="已派发上传任务", progress_val=35)
+            _update_status(component="video", status="RUNNING", details="已派发上传任务")
+            _calculate_and_update_progress('video_upload', 0.01) # 派发成功，给一点初始进度
             upload_queue.put({
                 'task_id': task_id, 'component': 'video', 'local_file_path': str(local_file_path),
                 'filename_for_link': filename, 'api_client_base_url': task_data['api_client_base_url'],
@@ -1463,18 +1535,44 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
             })
         else:
             _update_status(component="video", status="SKIPPED", details="用户未请求上传")
-
-        # 同时，如果第一步音频提取成功，则开始进行后续的、不冲突的音频处理和AI流程
+        
         if raw_audio_path_for_subtitle:
             try:
-                def sub_progress_callback(stage, details): _update_status(component="subtitle", details=details)
-                # 第二步：处理已提取的音频
+                # 定义字幕管线内部各个子阶段的进度分配
+                # 例如：预处理 20%, AI处理 60%, 字幕上传 20% (总和为100%)
+                def subtitle_pipeline_progress_updater(sub_stage_name, sub_stage_progress_percent):
+                    base_progress = 0.10 # 音频提取已经占了10%
+                    if sub_stage_name == "preprocess": # VAD 等占 20%
+                        base_progress += 0.0
+                        total_contribution = sub_stage_progress_percent * 0.20
+                    elif sub_stage_name == "ai_transcribe": # AI 处理占 60%
+                        base_progress += 0.20
+                        total_contribution = sub_stage_progress_percent * 0.60
+                    elif sub_stage_name == "upload": # 字幕上传占 10%
+                        base_progress += 0.80
+                        total_contribution = sub_stage_progress_percent * 0.10
+                    else:
+                        total_contribution = 0
+                    
+                    final_pipeline_progress = base_progress + total_contribution
+                    _calculate_and_update_progress('subtitle_pipeline', final_pipeline_progress)
+                
+                def sub_progress_callback(stage, details): 
+                    _update_status(component="subtitle", details=details)
+                    if stage == 'subtitle_vad':
+                        subtitle_pipeline_progress_updater("preprocess", 1.0) # VAD 完成算预处理完成
+                    if stage == 'subtitle_transcribing':
+                        # 我们可以从 details 里解析出进度，例如 "已处理 4/6 个字幕批次..."
+                        try:
+                            parts = details.split(" ")
+                            if len(parts) > 2 and "/" in parts[1]:
+                                done, total = map(int, parts[1].split('/'))
+                                subtitle_pipeline_progress_updater("ai_transcribe", done / total)
+                        except:
+                            pass # 解析失败就算了
+
                 audio_chunks = preprocess_audio_for_subtitles(raw_audio_path_for_subtitle, temp_dir, sub_progress_callback, ai_models)
-                
-                # 第三步：AI字幕生成
-                _update_status(component="subtitle", status="RUNNING", details="AI处理中...", progress_val=40)
                 srt_content = run_subtitle_extraction_pipeline(subtitle_config, audio_chunks, sub_progress_callback)
-                
                 if not srt_content: raise RuntimeError("未能生成有效的字幕内容。")
                 
                 srt_base64 = base64.b64encode(srt_content.encode('utf-8')).decode('utf-8')
@@ -1482,6 +1580,7 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
                 
                 if params["upload_subtitle"]:
                     _update_status(component="subtitle", status="RUNNING", details="已派发字幕上传任务")
+                    subtitle_pipeline_progress_updater("upload", 0.01) # 派发成功给一点进度
                     srt_filename = local_file_path.stem + ".srt"
                     srt_path = temp_dir / srt_filename
                     with open(srt_path, "w", encoding="utf-8") as f: f.write(srt_content)
@@ -1492,16 +1591,16 @@ def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, u
                     })
                 else:
                     _update_status(component="subtitle", status="SUCCESS", details="提取成功")
+                    _mark_stage_as_completed('subtitle_pipeline')
+
             except Exception as e:
                 _update_status(component="subtitle", status="FAILED", details=str(e), error_obj={"code": "SUBTITLE_PIPELINE_FAILED", "message": str(e)})
-
-        log_system_event("info", f"媒体处理进程为任务 {task_id} 的主要工作已完成。", in_worker=True)
-
+                _mark_stage_as_completed('subtitle_pipeline')
     except Exception as e:
         log_system_event("error", f"处理任务 {task_id} 时发生严重错误: {e}", in_worker=True)
         result_queue.put({'type': 'task_result', 'task_id': task_id, 'status': 'FAILED', 'result': {}, 'error': {"code": "FATAL_ERROR", "message": str(e)}})
     finally:
-        log_system_event("info", f"媒体处理进程 {task_id} 完成，不再清理主任务目录。", in_worker=True)
+        log_system_event("info", f"媒体处理进程 {task_id} 的主要工作已完成。", in_worker=True)
 
 # =============================================================================
 # --- 第 8 步: 多进程 Worker 与主程序 ---
@@ -1664,12 +1763,64 @@ def worker_process_loop(task_queue: multiprocessing.Queue, result_queue: multipr
 
 def result_processor_thread_loop(result_queue: multiprocessing.Queue):
     """
-    【修改后】结果处理器，增加了在任务达到最终状态后，负责清理任务临时目录的逻辑。
+    【进度计算优化最终版】结果处理器，现在能够接收并处理来自上传进程的细粒度
+    进度更新，并将其动态地反映到总任务进度上。
     """
     log_system_event("info", "结果处理线程已启动。")
+    
+    # ================== START: 新增与 process_unified_task 中对应的进度模型 ==================
+    #
+    # 这个模型需要在主进程的这个线程中也存在，以便能够正确解释和计算总进度。
+    # 它的状态由每个 task_id 唯一标识，并在任务结束时清理。
+    # 我们用一个字典来维护每个活动任务的进度模型实例。
+    #
+    task_progress_models = {}
+
+    class TaskProgressModel:
+        def __init__(self, params):
+            self.completed_weight = 0
+            
+            # 权重定义与 process_unified_task 中完全一致
+            PROGRESS_WEIGHTS = {
+                'download': 20,
+                'video_upload': 40,
+                'subtitle_pipeline': 40,
+            }
+            
+            self.active_weights = {}
+            if params.get("upload_video", True):
+                self.active_weights['video_upload'] = PROGRESS_WEIGHTS['video_upload']
+            
+            if params.get("extract_subtitle", False):
+                self.active_weights['subtitle_pipeline'] = PROGRESS_WEIGHTS['subtitle_pipeline']
+
+            if self.active_weights:
+                self.active_weights['download'] = PROGRESS_WEIGHTS['download']
+
+            self.total_active_weight = sum(self.active_weights.values())
+            if self.total_active_weight == 0:
+                self.total_active_weight = 100
+
+        def calculate_progress(self, current_stage: str, stage_progress_percent: float = 0.0) -> int:
+            current_stage_weight = self.active_weights.get(current_stage, 0)
+            current_progress_from_stage = current_stage_weight * stage_progress_percent
+            total_progress = (self.completed_weight + current_progress_from_stage)
+            normalized_progress = int((total_progress / self.total_active_weight) * 100) if self.total_active_weight > 0 else 100
+            return normalized_progress
+
+        def mark_stage_as_completed(self, stage_key: str):
+            if stage_key in self.active_weights:
+                # 防止重复累加
+                if stage_key not in getattr(self, '_completed_stages', set()):
+                    self.completed_weight += self.active_weights[stage_key]
+                    if not hasattr(self, '_completed_stages'):
+                        self._completed_stages = set()
+                    self._completed_stages.add(stage_key)
+
+    # =================== END: 新增进度模型 ===================
+
     while True:
         try:
-            # 使用长超时以防队列长时间空闲
             result_data = result_queue.get(timeout=3600)
             task_id = result_data['task_id']
 
@@ -1678,64 +1829,112 @@ def result_processor_thread_loop(result_queue: multiprocessing.Queue):
                     continue
 
                 task = tasks[task_id]
+                
+                # 在任务第一次被处理时，为其创建进度模型实例
+                if task_id not in task_progress_models:
+                     # task['params'] 需要在任务创建时就存进去，我们需要确保 unified_upload_endpoint 存了
+                    task_params = task.get('_internal_params') # 我们约定参数存在这里
+                    if task_params:
+                        task_progress_models[task_id] = TaskProgressModel(task_params)
+                
+                progress_model = task_progress_models.get(task_id)
+
                 task['updatedAt'] = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
                 
                 data_type = result_data.get('type')
                 
-                # --- 状态更新逻辑 ---
                 if data_type == 'status_update':
                     payload = result_data.get('payload', {})
-                    if 'progress' in payload: task['progress'] = payload['progress']
+                    
+                    # 只有从子进程发来的原始进度更新才需要在这里重新计算
+                    if 'progress' in payload and progress_model:
+                        # 这是来自 `process_unified_task` 的原始总进度更新
+                        # 我们相信它，直接更新
+                        task['progress'] = payload['progress']
+                    
                     if 'results' in payload:
                         for component, data in payload['results'].items():
                             if component in task['results']:
-                                if 'output' in data and 'output' in task['results'][component] and isinstance(task['results'][component]['output'], dict):
-                                    # 如果新旧 output 都是字典，则合并它们
+                                original_status = task['results'][component].get('status')
+                                
+                                # -- START: 处理来自 uploader 的上传进度 --
+                                if progress_model and 'details' in data and data['details'].startswith("正在上传 ("):
+                                    try:
+                                        # 解析上传百分比, e.g., "正在上传 (55%)"
+                                        percent_str = data['details'].split('(')[1].split('%')[0]
+                                        percent = float(percent_str) / 100.0
+                                        
+                                        # 确定是哪个组件的上传进度
+                                        stage_key = 'video_upload' if component == 'video' else 'subtitle_pipeline'
+                                        
+                                        # 如果是字幕上传，它只占字幕管线的最后10%
+                                        if component == 'subtitle':
+                                             # AI 占60%，预处理占20%，音频提取占10%，上传占10%
+                                            subtitle_base_progress = 0.90 # (10+20+60)/100
+                                            stage_percent = subtitle_base_progress + (percent * 0.10)
+                                        else:
+                                            stage_percent = percent
+                                        
+                                        # 调用模型计算总进度
+                                        new_progress = progress_model.calculate_progress(stage_key, stage_percent)
+                                        task['progress'] = new_progress
+
+                                    except (ValueError, IndexError):
+                                        pass # 解析失败则忽略此次进度更新
+                                # -- END: 处理上传进度 --
+                                        
+                                if 'output' in data and 'output' in task['results'][component] and isinstance(task['results'][component].get('output'), dict):
                                     task['results'][component]['output'].update(data['output'])
-                                    # 从 data 中移除 output，避免被下面的 update 再次处理
                                     del data['output']
                                 
-                                # 更新其他字段 (status, details, etc.)
                                 task['results'][component].update(data)
-                    # 只要有更新，就认为是RUNNING（除非已经是最终状态）
+                                
+                                # -- START: 根据组件状态完成情况更新进度 --
+                                if progress_model and data.get('status') != original_status and data.get('status') != 'RUNNING':
+                                    stage_key_to_complete = None
+                                    if component == 'video' and data.get('status') != 'PENDING':
+                                        stage_key_to_complete = 'video_upload'
+                                    # 注意：字幕组件的完成比较特殊，它需要其自身和上传都完成
+                                    elif component == 'subtitle' and data.get('status') == 'SUCCESS' and 'shareCode' in task['results']['subtitle'].get('output', {}):
+                                        stage_key_to_complete = 'subtitle_pipeline'
+                                    elif component == 'subtitle' and data.get('status') in ('FAILED', 'SKIPPED'):
+                                         stage_key_to_complete = 'subtitle_pipeline'
+
+                                    if stage_key_to_complete:
+                                        progress_model.mark_stage_as_completed(stage_key_to_complete)
+                                        # 更新一次最终进度
+                                        task['progress'] = progress_model.calculate_progress(stage_key_to_complete, 1.0)
+                                # -- END: 根据完成情况更新进度 --
+
                     if task['status'] not in ["SUCCESS", "FAILED", "PARTIAL_SUCCESS"]:
                          task['status'] = "RUNNING"
 
-                # --- 任务级结果（通常是严重错误） ---
                 elif data_type == 'task_result':
                     task['status'] = result_data.get('status', 'FAILED')
                     task['error'] = result_data.get('error')
                     task['progress'] = 100
                 
-                # --- 检查任务是否已达到最终状态 ---
+                # --- 任务结束的评估逻辑 (保持不变) ---
                 video_status = task['results']['video']['status']
                 subtitle_status = task['results']['subtitle']['status']
-                
-                # 检查所有子组件是否都已脱离“处理中”的状态
-                is_finished = "PENDING" not in (video_status, subtitle_status) and \
-                              "RUNNING" not in (video_status, subtitle_status)
+                is_finished = "PENDING" not in (video_status, subtitle_status) and "RUNNING" not in (video_status, subtitle_status)
 
-                # 如果任务已完成，并且尚未设置最终状态，则进行评估和清理
                 if is_finished and task['status'] not in ["SUCCESS", "FAILED", "PARTIAL_SUCCESS"]:
                     log_system_event("info", f"任务 {task_id} 所有组件已完成，正在进行最终状态评估。")
                     task['progress'] = 100
                     
-                    # 状态清理：处理因进程崩溃导致的 "RUNNING" 残留状态
                     for component in task['results']:
                         comp_data = task['results'][component]
                         if comp_data['status'] == 'RUNNING':
                             comp_data['status'] = 'FAILED'
                             comp_data['details'] = '组件因未知原因未能完成'
                             comp_data['error'] = { 'code': 'WORKER_CRASHED', 'message': '处理此组件的工作进程可能已意外终止。'}
-
-                    # 重新获取清理后的状态
+                    
                     final_video_status = task['results']['video']['status']
                     final_subtitle_status = task['results']['subtitle']['status']
-                    
-                    # 定义参与最终状态评估的状态列表 (排除 SKIPPED)
                     active_statuses = [s for s in (final_video_status, final_subtitle_status) if s != "SKIPPED"]
                     
-                    if not active_statuses: # 如果所有组件都被跳过
+                    if not active_statuses:
                         task['status'] = "SUCCESS"
                     elif all(s == "SUCCESS" for s in active_statuses):
                         task['status'] = "SUCCESS"
@@ -1744,12 +1943,15 @@ def result_processor_thread_loop(result_queue: multiprocessing.Queue):
                             task['status'] = "PARTIAL_SUCCESS"
                         else:
                             task['status'] = "FAILED"
-                    else: # 其他情况，例如全是SKIPPED和SUCCESS
+                    else:
                         task['status'] = "SUCCESS"
 
                     log_system_event("info", f"任务 {task_id} 最终状态被设置为: {task['status']}")
+                    
+                    # 任务结束，清理进度模型
+                    if task_id in task_progress_models:
+                        del task_progress_models[task_id]
 
-                    # 【核心新增】在此处执行清理操作
                     temp_dir_to_clean = Path(f"/kaggle/working/task_{task_id}")
                     if temp_dir_to_clean.exists():
                         log_system_event("info", f"任务 {task_id} 已结束，准备清理临时目录: {temp_dir_to_clean}")
@@ -1760,7 +1962,6 @@ def result_processor_thread_loop(result_queue: multiprocessing.Queue):
                             log_system_event("error", f"❌ 清理任务 {task_id} 的临时目录失败: {e}")
 
         except QueueEmpty:
-            # 队列为空是正常情况，继续循环
             continue
         except Exception as e:
             log_system_event("error", f"结果处理线程发生严重错误: {e}")
