@@ -586,7 +586,7 @@ class ProxyManager:
             test_filename = f"speed_test_{random_suffix}.tmp"
             return urljoin(api_client_base_url, f"/api/upload/{quote(test_filename)}")
         print("正在测试下载速度...")
-        
+
         download_speed = wifi.download() / 1_000_000  # 转换为Mbps
         print(f"下载速度: {download_speed:.2f} Mbps")
 
@@ -1896,8 +1896,8 @@ def main():
             log_system_event("error", f"PyTorch 安装失败！\nStdout: {install_proc.stdout}\nStderr: {install_proc.stderr}")
             raise RuntimeError("未能安装兼容的 PyTorch 版本。")
         log_system_event("info", "✅ 兼容的 PyTorch 安装完成。")
-        wifi = speedtest.Speedtest()
         install_other_cmd = "pip install -q pydantic pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai requests psutil speedtest-cli"
+        wifi = speedtest.Speedtest()
         log_system_event("info", "正在安装其余依赖库...")
         subprocess.run(install_other_cmd, shell=True, check=True)
         log_system_event("info", "✅ 其余依赖库安装完成。")
