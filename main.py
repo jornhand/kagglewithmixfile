@@ -30,7 +30,6 @@ import signal
 import sys
 import shutil
 import mimetypes
-import speedtest
 from pathlib import Path
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, quote, unquote
@@ -44,6 +43,7 @@ from queue import Empty as QueueEmpty
 # --- Web 框架与 HTTP 客户端 ---
 from flask import Flask, request, jsonify, Response
 import requests
+import speedtest
 
 
 
