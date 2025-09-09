@@ -31,7 +31,7 @@ import sys
 import shutil
 import mimetypes
 from pathlib import Path
-from datetime import timedelta
+from datetime import datetime, timedelta
 from urllib.parse import urljoin, quote, unquote
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed, TimeoutError
 
@@ -1256,17 +1256,78 @@ def unified_upload_endpoint():
         "status_url": f"/api/tasks/{task_id}"
     }), 202
 
+# --- (将下面的函数完整替换掉原来的版本) ---
 @app.route("/api/tasks/<task_id>", methods=["GET"])
 def get_task_status_endpoint(task_id):
-    # 获取指定任务的当前状态和结果。
+    #
+    # 【健壮版】获取任务状态，并处理僵尸/超时任务，确保总能发出“任务完成”信号。
+    #
     with tasks_lock:
         task = tasks.get(task_id)
-    
-    if task:
-        return jsonify(task)
-    else:
-        return jsonify({"error": "未找到指定的 task_id"}), 404
 
+    if not task:
+        # 如果任务不存在，这本身就是一个最终状态。
+        # 我们返回 404，但可以加上完成信号头，
+        # 以防协调器侧认为会话存在但Worker侧已清理。
+        response = jsonify({"error": "未找到指定的 task_id", "status": "NOT_FOUND"})
+        response.status_code = 404
+        response.headers['X-Task-Completed'] = 'true'
+        log_system_event("warning", f"查询不存在的任务 {task_id}，发送清理信号。")
+        return response
+
+    # --- START OF THE MODIFICATION ---
+    
+    # 定义任务的“最终状态”和“活动状态”
+    terminal_states = {"SUCCESS", "FAILED", "PARTIAL_SUCCESS"}
+    active_states = {"QUEUED", "RUNNING"}
+    
+    # 检查任务是否已经处于已知的最终状态
+    current_status = task.get("status")
+    if current_status in terminal_states:
+        # 任务已正常结束，按原计划添加完成信号
+        response = jsonify(task)
+        response.headers['X-Task-Completed'] = 'true'
+        return response
+
+    # 如果任务不处于最终状态，则检查是否“僵死”
+    if current_status in active_states:
+        # 定义一个超时阈值，例如30分钟
+        # updatedAt 应该在每次状态更新时被修改
+        MAX_STUCK_DURATION = timedelta(minutes=300)
+        try:
+            # 解析任务的 updatedAt 时间戳
+            updated_at_str = task.get("updatedAt", task.get("createdAt"))
+            # 移除 'Z' 并处理毫秒部分
+            updated_at_str = updated_at_str.replace('Z', '').split('.')[0]
+            last_update_time = datetime.strptime(updated_at_str, '%Y-%m-%dT%H:%M:%S')
+
+            if datetime.utcnow() - last_update_time > MAX_STUCK_DURATION:
+                log_system_event("error", f"任务 {task_id} 状态为 {current_status} 已超过 {MAX_STUCK_DURATION} 未更新，判定为僵死。")
+                
+                # 主动将任务标记为失败
+                task["status"] = "FAILED"
+                task["error"] = {
+                    "code": "TASK_TIMEOUT",
+                    "message": f"Task was stuck in '{current_status}' state for too long."
+                }
+                # 更新任务状态，以便下次查询能看到失败信息
+                with tasks_lock:
+                    tasks[task_id] = task
+
+                # 既然我们已经仲裁了它的最终状态，现在就可以发送“完成”信号了
+                response = jsonify(task)
+                response.status_code = 500 # 表示任务本身失败了
+                response.headers['X-Task-Completed'] = 'true'
+                return response
+        except (ValueError, KeyError) as e:
+            # 如果时间戳格式不正确或不存在，记录错误但继续
+            log_system_event("warning", f"无法解析任务 {task_id} 的时间戳来检查超时: {e}")
+
+    # 如果任务不处于最终状态，也不被认为是僵死，
+    # 则正常返回当前状态，不带“完成”信号
+    return jsonify(task)
+    
+    # --- END OF THE MODIFICATION ---
 
 @app.route('/killer_status_frp', methods=['GET'])
 def health_status_endpoint():
