@@ -30,6 +30,7 @@ import signal
 import sys
 import shutil
 import mimetypes
+import speedtest
 from pathlib import Path
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, quote, unquote
