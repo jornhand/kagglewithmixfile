@@ -548,7 +548,7 @@ class ProxyManager:
         """
         try:
             # 使用较小的测试数据以加快测速过程
-            test_data_size = 5 * 1024 * 1024  # 1MB
+            test_data_size = 1 * 1024 * 1024  # 1MB
             test_data = os.urandom(test_data_size)
             
             start_time = time.time()
