@@ -1889,7 +1889,7 @@ def main():
         
         install_torch_cmd = (
             "pip uninstall -y torch torchvision torchaudio && "
-            "pip install torch==2.3.0 torchaudio==2.3.0 --index-url https://download.pytorch.org/whl/cu121"
+            "pip install speedtest-cli torch==2.3.0 torchaudio==2.3.0 --index-url https://download.pytorch.org/whl/cu121"
         )
         log_system_event("info", "正在安装兼容的 PyTorch 版本...")
         install_proc = subprocess.run(install_torch_cmd, shell=True, capture_output=True, text=True)
@@ -1897,7 +1897,7 @@ def main():
             log_system_event("error", f"PyTorch 安装失败！\nStdout: {install_proc.stdout}\nStderr: {install_proc.stderr}")
             raise RuntimeError("未能安装兼容的 PyTorch 版本。")
         log_system_event("info", "✅ 兼容的 PyTorch 安装完成。")
-        install_other_cmd = "pip install -q pydantic pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai requests psutil speedtest-cli"
+        install_other_cmd = "pip install -q pydantic pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai requests psutil"
         
         log_system_event("info", "正在安装其余依赖库...")
         subprocess.run(install_other_cmd, shell=True, check=True)
