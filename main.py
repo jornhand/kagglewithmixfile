@@ -33,7 +33,8 @@ import mimetypes
 from pathlib import Path
 from datetime import timedelta
 from urllib.parse import urljoin, quote, unquote
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed, TimeoutError
+
 
 # --- 多进程与队列 ---
 import multiprocessing
@@ -42,6 +43,22 @@ from queue import Empty as QueueEmpty
 # --- Web 框架与 HTTP 客户端 ---
 from flask import Flask, request, jsonify, Response
 import requests
+
+
+
+
+
+# =============================================================================
+# --- (新增模块) 第 3.5 步: V2Ray 代理管理器 ---
+# =============================================================================
+import base64
+import json
+import random
+import string
+from urllib.parse import urlparse, parse_qs
+
+
+
 
 # --- 加密与密钥管理 ---
 # 尝试导入关键库，如果失败则在后续检查中处理
@@ -73,7 +90,7 @@ except ImportError as e:
 # -- A. MixFileCLI 配置 --
 mixfile_config_yaml = """
 uploader: "线路A2"
-upload_task: 10
+upload_task: 20
 upload_retry: 10
 download_task: 5
 chunk_size: 1024
@@ -88,10 +105,10 @@ history: "history.mix_list"
 # !!! 重要 !!!
 # 在这里粘贴你从 encrypt_util.py 工具中获得的加密配置字符串
 # 第一个字符串用于 FRP (反向代理)
-ENCRYPTED_FRP_CONFIG = "gAAAAABouqe8kDRGZxX7I43TbmNqmy2TZNRJK0f5GqrXwKwW0VR3TtfyfFmDvHCtPbfMzcBkT1qgfMPzhPWDuHRmwibWSmVOgi4nZe_J1TTmLAWMSzQOieGMWE2LXRIIKbf-dLMCnjPDKRkLmZBuWtreN5QgZC41Px3hRU7pxqw51edAkOmvZiE7nf9G0AQ0IvCAR9WHMDg6"
+ENCRYPTED_FRP_CONFIG = "gAAAAABovr0nLhcvqidm1uzqWvVToI9StZZAAa9vgtqoxlXSKuMosiX8yEzEIwPrDghud3lGK0zRB0pLsc14E8Bvbk8OxSQVL_NT31PHrXsz6ulKWJYo6fNU3ycOuBoeSWLkou4-HP33INu5SyWH5rnLqvGW8KuFcZtV9qtM-A3zX-dDzDMdhBo5NeS_u5yHpCKy478r029Y"
 
 # 第二个字符串用于字幕服务 (Gemini API 密钥等)
-ENCRYPTED_SUBTITLE_CONFIG = "gAAAAABouqgGsJh7-osSg3oc2OhtcGotCfGufGZLgeV_4hF6mr5qrhh2wKCjalhFRuPdeUPMNHWqz5CRju55o4CPcr_Deprf-hktkuQ9sDhtRI0mWMkqqwlqPO28AClTO-q0bKXZ74BEPcTCXPVeHZaG_gTolEMblHXXuNK7Mm3VlJV7S5PE1WuvjG4uhne7UtbzYWx5TBE46df09vAxEXb7Tyo05B2jSjkm8NVM3JRmOfSWFpvv9r-J7n3ZCyPCHDj6hc0-6IBkqnX4il41zdgovtxXVugNeploPQylxPI240L1nm6zRKfSlplkNhZ3k1reH3LjDyY1zfp5aEhNKqQXBUrQY_4c--Km2LbQml9BbjRhOnJmUF2uo7Aa7c8mZUM4-jWNDU8KD0dCJFrWkeUQoW7bPlicrw==" # 示例，请替换
+ENCRYPTED_SUBTITLE_CONFIG = "gAAAAABovr1QY48Fe_jcPlBAYeYyO8Dx2woxKVlQcukRmw-Uh0mVw63YT0OBVdmXMaF5Ksj-zTZSdjAvJtpht7sjx7WtjMSXeYzB_dzqrb43X7zqGN_T-blYp285D33QUnr0tfCVR4j9BuTP7KquQNm7yrFhV0zOXOnherA2OoP9htPWJ3Z45igpAj_LxYh4cOXRtPMCGdRza5vnBjlgWyuQVTg6p-1kYfiPi9lGzwgGoqoSsfJkK69TFWUM9IRrrIIz56urbQOsvYP7wtM1pqJ0ReKKRSWq6A4mXVJKMJj0Su1tuQTPSX8otiM3Y2EYwFy6J7JXdVs6zbTSRFzzQ05JXSpEl0eZ62G91ZnBtmpOArrUvqh0JsWfWVUk3D2-ijxfBnVcJ3xu1y6slW2jPtS7J2PBI_lgi939-aTecrKYl-yPj7XbxeAvSZecl_tJj8l0p1XMDmFWNol_A4UeRxI8exMCQd9QCXyTT07kIo2CF5r32FF0yPIlCdKmw-0petX2wnYxnkrG" # 示例，请替换
 
 # -- C. 本地服务与端口配置 --
 MIXFILE_LOCAL_PORT = 4719
@@ -363,6 +380,276 @@ def _shutdown_notebook_kernel_immediately():
     # SIGKILL (信号 9) 是一个无法被捕获或忽略的信号，比 os._exit 更为强制。
     os.kill(os.getpid(), signal.SIGKILL)
 
+
+
+
+
+
+# =============================================================================
+# --- (新增模块) 第 3.5 步: V2Ray 代理管理器 ---
+# =============================================================================
+
+class ProxyManager:
+    """
+    【重构版】按需为上传任务寻找最优代理线路的工具类。
+    它被设计为在工作进程中按需实例化和使用，不管理常驻后台进程。
+    """
+    def __init__(self, sub_url=None):
+        self.sub_url = sub_url
+        self.xray_path = Path("/kaggle/working/xray")
+        self.config_path = Path("/kaggle/working/xray_config.json")
+        self.local_socks_port = 10808
+        self.geoip_path = Path("/kaggle/working/geoip.dat")
+        self.geosite_path = Path("/kaggle/working/geosite.dat")
+
+    def _ensure_xray_assets(self):
+        """确保 Xray 核心及数据库文件已下载。"""
+        if self.xray_path.exists() and self.geoip_path.exists() and self.geosite_path.exists():
+            return
+
+        log_system_event("info", "检测到Xray组件缺失，正在下载...", in_worker=True)
+        xray_url = "https://github.com/XTLS/Xray-core/releases/download/v1.8.10/Xray-linux-64.zip"
+        geoip_url = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+        geosite_url = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+        zip_path = Path("/kaggle/working/xray.zip")
+        
+        try:
+            if not self.xray_path.exists():
+                log_system_event("info", "  -> 下载 Xray core...", in_worker=True)
+                run_command(f"wget -q -O {zip_path} {xray_url}").wait()
+                run_command(f"unzip -o {zip_path} xray -d /kaggle/working/").wait()
+                self.xray_path.chmod(0o755)
+                zip_path.unlink()
+            if not self.geoip_path.exists():
+                log_system_event("info", "  -> 下载 geoip.dat...", in_worker=True)
+                run_command(f"wget -q -O {self.geoip_path} {geoip_url}").wait()
+            if not self.geosite_path.exists():
+                log_system_event("info", "  -> 下载 geosite.dat...", in_worker=True)
+                run_command(f"wget -q -O {self.geosite_path} {geosite_url}").wait()
+            log_system_event("info", "✅ Xray组件下载完成。", in_worker=True)
+        except Exception as e:
+            raise RuntimeError(f"下载 Xray 组件失败: {e}")
+
+    def _fetch_and_parse_subscription(self):
+        """获取并解析订阅链接，返回节点链接列表。"""
+        if not self.sub_url:
+            return []
+        log_system_event("info", f"正在从 {self.sub_url[:30]}... 获取订阅...", in_worker=True)
+        try:
+            response = requests.get(self.sub_url, timeout=20)
+            response.raise_for_status()
+            decoded_content = base64.b64decode(response.content).decode('utf-8')
+            return decoded_content.strip().split('\n')
+        except Exception as e:
+            log_system_event("error", f"获取或解析订阅失败: {e}", in_worker=True)
+            return []
+
+    def _generate_node_config(self, node_url):
+        """根据节点URL生成Xray的JSON配置（包含路由）。"""
+        try:
+            parsed_url = urlparse(node_url)
+            node_name_raw = parsed_url.fragment
+            node_name = unquote(node_name_raw) if node_name_raw else "Unnamed Node"
+            
+            # --- 步骤 1: 构建 Outbounds ---
+            #
+            # Proxy Outbound (tag: "proxy")
+            protocol = parsed_url.scheme
+            proxy_outbound = {"protocol": protocol, "settings": {}, "tag": "proxy"}
+            
+            if protocol == "vmess":
+                try:
+                    decoded_vmess_str = base64.b64decode(parsed_url.netloc).decode('utf-8')
+                    decoded_vmess = json.loads(decoded_vmess_str)
+                except Exception:
+                     return None, f"Invalid VMess format for node {node_name}"
+
+                proxy_outbound["settings"]["vnext"] = [{
+                    "address": decoded_vmess["add"],
+                    "port": int(decoded_vmess["port"]),
+                    "users": [{"id": decoded_vmess["id"], "alterId": int(decoded_vmess["aid"]), "security": decoded_vmess.get("scy", "auto")}]
+                }]
+                stream_settings = {"network": decoded_vmess.get("net", "tcp")}
+                if stream_settings["network"] == "ws":
+                    ws_settings = {"path": decoded_vmess.get("path", "/")}
+                    host = decoded_vmess.get("host")
+                    if host:
+                        ws_settings["headers"] = {"Host": host}
+                    stream_settings["wsSettings"] = ws_settings
+                if decoded_vmess.get("tls", "") == "tls":
+                     stream_settings["security"] = "tls"
+                     stream_settings["tlsSettings"] = {"serverName": decoded_vmess.get("sni", decoded_vmess.get("host", decoded_vmess["add"]))}
+                proxy_outbound["streamSettings"] = stream_settings
+
+            elif protocol == "vless":
+                qs = parse_qs(parsed_url.query)
+                user_obj = { "id": parsed_url.username, "encryption": "none", "flow": qs.get("flow", [None])[0], "alterId": 0, "security": "auto" }
+                if user_obj["flow"] is None: del user_obj["flow"]
+                proxy_outbound["settings"]["vnext"] = [{"address": parsed_url.hostname, "port": int(parsed_url.port), "users": [user_obj]}]
+                stream_settings = {"network": qs.get("type", ["tcp"])[0]}
+                if stream_settings["network"] == "ws":
+                    ws_path = unquote(qs.get("path", ["/"])[0])
+                    ws_host = unquote(qs.get("host", [""])[0])
+                    ws_settings = {"path": ws_path}
+                    if ws_host: ws_settings["headers"] = {"Host": ws_host}
+                    stream_settings["wsSettings"] = ws_settings
+                if qs.get("security", ["none"])[0] == "tls":
+                    stream_settings["security"] = "tls"
+                    tls_sni = unquote(qs.get("sni", [""])[0]) or unquote(qs.get("host", [""])[0]) or parsed_url.hostname
+                    fp = qs.get("fp", ["random"])[0]
+                    tls_settings = {"serverName": tls_sni, "fingerprint": fp, "allowInsecure": False, "show": False}
+                    alpn = qs.get("alpn")
+                    if alpn: tls_settings["alpn"] = [val for val in alpn[0].split(',') if val]
+                    stream_settings["tlsSettings"] = tls_settings
+                proxy_outbound["streamSettings"] = stream_settings
+            else:
+                return None, f"Unsupported protocol: {protocol}"
+
+            # Direct Outbound (tag: "direct")
+            direct_outbound = {"protocol": "freedom", "settings": {}, "tag": "direct"}
+            
+            # Block Outbound (tag: "block") - for ads, etc.
+            block_outbound = {"protocol": "blackhole", "settings": {}, "tag": "block"}
+
+            # --- 步骤 2: 构建最终配置 ---
+            config = {
+                "log": {"loglevel": "warning"},
+                "dns": { "servers": ["8.8.8.8", "1.1.1.1", "localhost"] },
+                "inbounds": [{
+                    "port": self.local_socks_port,
+                    "protocol": "socks",
+                    "listen": "127.0.0.1",
+                    "settings": {"auth": "noauth", "udp": True},
+                    "sniffing": { "enabled": True, "destOverride": ["http", "tls"] }
+                }],
+                "outbounds": [
+                    proxy_outbound,
+                    direct_outbound,
+                    block_outbound
+                ],
+                "routing": {
+                    "domainStrategy": "AsIs",
+                    "rules": [
+                        { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" },
+                        { "type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block" },
+                    ]
+                }
+            }
+            return config, node_name
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return None, f"Error parsing node '{node_name}': {e}"
+
+    def _test_upload_speed(self, test_upload_url, proxies=None):
+        """
+        【状态隔离修复版】测试上传速度的核心函数。
+        它接收一个完整的、包含唯一文件名的 URL 进行测试。
+        """
+        try:
+            # 使用较小的测试数据以加快测速过程
+            test_data_size = 5 * 1024 * 1024  # 1MB
+            test_data = os.urandom(test_data_size)
+            
+            start_time = time.time()
+            # 直接使用传入的、唯一的 URL
+            response = requests.put(test_upload_url, data=test_data, proxies=proxies, timeout=30)
+            end_time = time.time()
+            
+            response.raise_for_status() # 确保上传成功 (返回 2xx 状态码)
+
+            # 注意：我们不再尝试删除测速文件，因为它们的文件名是唯一的，
+            # 留存在服务器上不会对后续操作产生冲突。
+            # MixFileCLI 服务重启或手动清理即可。
+
+            duration = end_time - start_time
+            if duration > 0:
+                return (test_data_size / duration) / (1024 * 1024)  # MB/s
+            else:
+                # 如果时间过短，给一个极高的速度值，而不是0，以表示连接非常快
+                return 999 
+        except Exception as e:
+            log_system_event("debug", f"测速失败 (proxy: {bool(proxies)}): {type(e).__name__}", in_worker=True)
+            return 0
+
+    def get_best_proxy_for_upload(self, api_client_base_url):
+        """
+        【状态隔离最终版】执行完整的按需测速流程。
+        为每一次独立的测速（包括直连）都生成一个唯一的上传URL，确保无状态冲突。
+        """
+        log_system_event("info", "====== 开始按需测速 ======", in_worker=True)
+        self._ensure_xray_assets()
+
+        # --- 内部辅助函数，用于生成唯一的测试URL ---
+        def generate_unique_test_url():
+            random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+            test_filename = f"speed_test_{random_suffix}.tmp"
+            return urljoin(api_client_base_url, f"/api/upload/{quote(test_filename)}")
+
+        # 1. 测试直连速度
+        direct_test_url = generate_unique_test_url()
+        direct_speed = self._test_upload_speed(direct_test_url)
+        log_system_event("info", f"  -> 直连速度: {direct_speed:.2f} MB/s", in_worker=True)
+
+        best_node_config = None
+        best_node_speed = direct_speed
+        best_node_name = "Direct Connection"
+
+        # 2. 循环测试所有代理节点
+        node_urls = self._fetch_and_parse_subscription()
+        if not node_urls:
+            log_system_event("warning", "未获取到代理节点，将使用直连。", in_worker=True)
+            log_system_event("info", "====== 测速结束 ======", in_worker=True)
+            return None, None
+
+        # 限制测速节点数量
+        num_to_test = 3 if len(node_urls) > 3 else len(node_urls)
+        nodes_to_test = random.sample(node_urls, num_to_test)
+        log_system_event("info", f"随机选择 {len(nodes_to_test)} 个节点进行测速...", in_worker=True)
+
+        for node_url in nodes_to_test:
+            node_config, node_name = self._generate_node_config(node_url.strip())
+            if not node_config: 
+                log_system_event("warning", f"解析节点失败，跳过: {node_name}", in_worker=True)
+                continue
+
+            log_system_event("info", f"  -> 正在测试节点: {node_name}...", in_worker=True)
+            with open(self.config_path, 'w') as f:
+                json.dump(node_config, f)
+            
+            process = run_command(f"{self.xray_path} -c {self.config_path}")
+            if not wait_for_port(self.local_socks_port, host='127.0.0.1', timeout=10):
+                log_system_event("warning", f"     节点 {node_name} 启动失败。", in_worker=True)
+                process.terminate()
+                process.wait()
+                continue
+            
+            proxies = {'http': f'socks5h://127.0.0.1:{self.local_socks_port}', 'https': f'socks5h://127.0.0.1:{self.local_socks_port}'}
+            
+            # 【核心修改】为每个代理节点也生成唯一的测试URL
+            node_test_url = generate_unique_test_url()
+            node_speed = self._test_upload_speed(node_test_url, proxies=proxies)
+            log_system_event("info", f"     节点 {node_name} 速度: {node_speed:.2f} MB/s", in_worker=True)
+
+            if node_speed > best_node_speed:
+                best_node_speed = node_speed
+                best_node_config = node_config
+                best_node_name = node_name
+
+            process.terminate()
+            process.wait()
+            time.sleep(1)
+
+        log_system_event("info", "="*28, in_worker=True)
+        log_system_event("info", f"  最优线路: {best_node_name}", in_worker=True)
+        log_system_event("info", f"  最高速度: {best_node_speed:.2f} MB/s", in_worker=True)
+        log_system_event("info", "="*28, in_worker=True)
+        log_system_event("info", "====== 测速结束 ======", in_worker=True)
+
+        if best_node_config:
+            return {'http': f'socks5h://127.0.0.1:{self.local_socks_port}', 'https': f'socks5h://127.0.0.1:{self.local_socks_port}'}, best_node_config
+        else:
+            return None, None
 # =============================================================================
 # --- 第 4 步: 字幕提取核心模块 (在子进程中调用) ---
 # =============================================================================
@@ -456,61 +743,64 @@ def read_and_encode_file_base64(filepath: str) -> str | None:
 
 # --- C. 音频预处理管道 ---
 
-def preprocess_audio_for_subtitles(
+def extract_audio_with_ffmpeg(
     video_path: Path,
     temp_dir: Path,
-    update_status_callback: callable,
-    ai_models: dict  # <--- 修改：增加 ai_models 参数
-) -> list[dict]:
-    #
-    # 完整的音频预处理流程：提取 -> 降噪 -> VAD 切分。
-    #
-    # Args:
-    #     video_path (Path): 输入的视频文件路径。
-    #     temp_dir (Path): 用于存放所有中间文件的临时目录。
-    #     update_status_callback (callable): 用于更新任务状态的回调函数。
-    #
-    # Returns:
-    #     list[dict]: 一个包含所有有效语音片段信息的列表，
-    #                 每个元素是 {"path": str, "start_ms": int, "end_ms": int}。
-    # 
-    # Raises:
-    #     Exception: 如果在任何关键步骤（如 ffmpeg）中发生失败。
-    #
-    
-    # 1. 使用 ffmpeg 提取原始音频
-    update_status_callback(stage="subtitle_extract_audio", details="正在从视频中提取音频...")
+    update_status_callback: callable
+) -> Path:
+    """
+    【新增】只负责从视频中提取音频的函数。
+    这个过程会锁定视频文件，完成后即释放。
+    返回提取出的音频文件路径。
+    """
+    update_status_callback(stage="subtitle_extract_audio", details="正在从视频中提取音频 (ffmpeg)...")
     raw_audio_path = temp_dir / "raw_audio.wav"
     try:
         command = [
             "ffmpeg", "-i", str(video_path),
-            "-ac", "1", "-ar", "16000", # 单声道, 16kHz 采样率 (语音识别标准)
+            "-ac", "1", "-ar", "16000",
             "-vn", "-y", "-loglevel", "error", str(raw_audio_path)
         ]
-        # 使用 subprocess.run 等待命令完成
         process = subprocess.run(command, check=True, capture_output=True, text=True)
+        return raw_audio_path
     except subprocess.CalledProcessError as e:
         log_system_event("error", f"FFmpeg 提取音频失败。Stderr: {e.stderr}", in_worker=True)
         raise RuntimeError(f"FFmpeg 提取音频失败: {e.stderr}")
 
-    # 2. 尝试加载 AI 降噪模型
-    # 2. 获取预加载的 AI 降噪模型
+def preprocess_audio_for_subtitles(
+    raw_audio_path: Path, # <--- 输入参数变更
+    temp_dir: Path,
+    update_status_callback: callable,
+    ai_models: dict
+) -> list[dict]:
+    """
+    【修改后】接收一个已提取的音频文件，执行后续的降噪、VAD切分。
+    这个过程不再接触原始视频文件。
+    """
+    # 1. 检查降噪模型
     denoiser_model = ai_models.get("denoiser")
     if denoiser_model:
         update_status_callback(stage="subtitle_denoise", details="AI 降噪模型已加载，准备处理...")
         log_system_event("info", "将使用预加载的 AI 降噪模型。", in_worker=True)
     else:
         log_system_event("warning", "降噪模型不可用，将跳过降噪步骤。", in_worker=True)
-    # <--- 修改结束 --->
 
-
-    # 3. 分块处理音频：降噪 -> VAD
+    # 2. 分块处理音频：降噪 -> VAD
     update_status_callback(stage="subtitle_vad", details="正在进行音频分块与语音检测...")
-    original_audio = AudioSegment.from_wav(raw_audio_path)
+    try:
+        original_audio = AudioSegment.from_wav(raw_audio_path)
+    except Exception as e:
+        raise RuntimeError(f"无法加载提取出的音频文件 {raw_audio_path}: {e}")
+        
     total_duration_ms = len(original_audio)
     chunk_files = []
     chunks_dir = temp_dir / "audio_chunks"
     chunks_dir.mkdir(exist_ok=True)
+    
+    # 清理可能存在的旧音频块
+    for item in chunks_dir.iterdir():
+        item.unlink()
+
     num_chunks = -(-total_duration_ms // SUBTITLE_CHUNK_DURATION_MS)
 
     for i in range(num_chunks):
@@ -525,7 +815,7 @@ def preprocess_audio_for_subtitles(
         
         processing_path = temp_chunk_path
         
-        # 3.1 AI 降噪 (如果模型加载成功)
+        # 2.1 AI 降噪 (如果模型加载成功)
         if denoiser_model:
             try:
                 wav, sr = torchaudio.load(temp_chunk_path)
@@ -538,23 +828,17 @@ def preprocess_audio_for_subtitles(
             except Exception as e:
                 log_system_event("warning", f"当前块降噪失败，将使用原始音频。错误: {e}", in_worker=True)
         
-        # 3.2 VAD 语音检测
+        # 2.2 VAD 语音检测
         try:
             from faster_whisper.audio import decode_audio
             from faster_whisper.vad import VadOptions, get_speech_timestamps
             
-            vad_parameters = {
-                "threshold": 0.38, 
-                "min_speech_duration_ms": 150, 
-                "max_speech_duration_s": 15.0, # 稍微放宽以容纳长句
-                "min_silence_duration_ms": 1500, 
-                "speech_pad_ms": 500
-            }
+            vad_parameters = { "threshold": 0.38, "min_speech_duration_ms": 150, "max_speech_duration_s": 15.0, "min_silence_duration_ms": 1500, "speech_pad_ms": 500 }
             sampling_rate = 16000
             audio_data = decode_audio(str(processing_path), sampling_rate=sampling_rate)
             speech_timestamps = get_speech_timestamps(audio_data, vad_options=VadOptions(**vad_parameters))
             
-            # 3.3 根据 VAD 结果从原始音频中精确切片
+            # 2.3 根据 VAD 结果从原始音频中精确切片
             for speech in speech_timestamps:
                 relative_start_ms = int(speech["start"] / sampling_rate * 1000)
                 relative_end_ms = int(speech["end"] / sampling_rate * 1000)
@@ -564,11 +848,7 @@ def preprocess_audio_for_subtitles(
                 final_chunk = original_audio[absolute_start_ms:absolute_end_ms]
                 final_chunk_path = chunks_dir / f"chunk_{absolute_start_ms}.wav"
                 final_chunk.export(str(final_chunk_path), format="wav")
-                chunk_files.append({
-                    "path": str(final_chunk_path),
-                    "start_ms": absolute_start_ms,
-                    "end_ms": absolute_end_ms
-                })
+                chunk_files.append({ "path": str(final_chunk_path), "start_ms": absolute_start_ms, "end_ms": absolute_end_ms })
         except Exception as e:
             log_system_event("error", f"当前块 VAD 处理失败: {e}", in_worker=True)
     
@@ -582,37 +862,39 @@ def _process_subtitle_batch_with_ai(
     group_index: int,
     api_key: str,
     gemini_endpoint_prefix: str,
-    prompt_api_url: str  # <--- 核心修改：不再接收提示词本身，而是接收API的URL
+    prompt_api_url: str
 ) -> list[dict]:
-    #
-    # 处理单个批次的音频块，调用 Gemini API 获取字幕。
-    # 这是一个内部函数，由主调度器调用。
-    #
-    thread_local_srt_list = []
-    log_system_event("info", f"[字幕任务 {group_index+1}] 已启动...", in_worker=True)
+    """
+    处理单个批次的音频块，调用 Gemini API 获取字幕。
+    (优化版 v2: 明确抛出异常，而不是返回空列表，以便上层捕获)
+    """
+    log_system_event("info", f"[字幕任务 {group_index+1}] 已在独立进程中启动...", in_worker=True)
+    
+    # 【核心修改】: 将整个函数逻辑包裹在一个大的 try...except 块中。
+    # 这样做的目的是，无论发生何种类型的错误（网络、API、数据解析等），
+    # 都能确保它被重新抛出，而不是被函数内部消化掉。
     try:
-        # 【新逻辑】：在每个批次处理开始时，独立获取动态提示词
+        # 1. 获取动态提示词
         system_instruction, prompt_for_task = get_dynamic_prompts(prompt_api_url)
 
-        # 1. 构建 REST API 请求体 (payload) - 后续逻辑保持不变
+        # 2. 构建 REST API 请求体 (payload)
         model_name = "gemini-2.5-flash"
-        
         generate_url = f"{gemini_endpoint_prefix.rstrip('/')}/v1beta/models/{model_name}:generateContent"
-        
         headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
         
         parts = [{"text": prompt_for_task}]
         for chunk in chunk_group:
             encoded_data = read_and_encode_file_base64(chunk["path"])
             if not encoded_data:
-                log_system_event("error", f"[字幕任务 {group_index+1}] 文件 {chunk['path']} 编码失败，跳过此文件。", in_worker=True)
+                # 如果单个文件编码失败，记录警告并跳过，不影响整个批次
+                log_system_event("warning", f"[字幕任务 {group_index+1}] 文件 {chunk['path']} 编码失败，将跳过此音频片段。", in_worker=True)
                 continue
             parts.append({"text": f"[AUDIO_INFO] {chunk['start_ms']} --> {chunk['end_ms']}"})
             parts.append({"inlineData": {"mime_type": "audio/wav", "data": encoded_data}})
         
         if len(parts) <= 1:
-            log_system_event("error", f"[字幕任务 {group_index+1}] 整个批次均无法编码，放弃。", in_worker=True)
-            return []
+            # 如果整个批次的所有文件都无法编码，这是一个致命错误，应抛出异常
+            raise ValueError(f"批次 {group_index+1} 中的所有音频文件均无法编码，任务中止。")
 
         payload = {
             "contents": [{"parts": parts}],
@@ -626,24 +908,26 @@ def _process_subtitle_batch_with_ai(
             "generationConfig": {"responseMimeType": "application/json"}
         }
 
-        # 2. 发送请求并实现全面的重试逻辑
-        log_system_event("info", f"[字幕任务 {group_index+1}] 数据准备完毕，正在调用 Gemini API at {generate_url}...", in_worker=True)
+        # 3. 发送请求并实现全面的重试逻辑
+        log_system_event("info", f"[字幕任务 {group_index+1}] 数据准备完毕，正在调用 Gemini API...", in_worker=True)
         max_retries = 3
+        last_exception = None
+        
         for attempt in range(max_retries):
             try:
-                response = requests.post(generate_url, headers=headers, json=payload, timeout=360)
+                # 使用稍长的超时时间，因为可能包含大量音频数据
+                response = requests.post(generate_url, headers=headers, json=payload, timeout=300) 
                 
+                # 可重试的服务器端错误
                 if response.status_code in [429, 500, 503, 504]:
                     log_system_event("warning", f"[字幕任务 {group_index+1}] 遇到可重试的 API 错误 (HTTP {response.status_code}, 尝试 {attempt + 1}/{max_retries})。", in_worker=True)
-                    if attempt < max_retries - 1:
-                        wait_time = 5 * (2 ** attempt)
-                        log_system_event("info", f"{wait_time}秒后将自动重试...", in_worker=True)
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        response.raise_for_status()
+                    # 触发下一次循环的重试
+                    raise requests.exceptions.HTTPError(f"Server error: {response.status_code}")
 
+                # 任何其他非2xx的状态码，都视为不可重试的失败
                 response.raise_for_status()
+                
+                # --- 如果请求成功，则处理响应 ---
                 response_data = response.json()
                 
                 candidates = response_data.get("candidates")
@@ -654,16 +938,18 @@ def _process_subtitle_batch_with_ai(
                 if not content:
                     finish_reason = candidates[0].get("finishReason", "未知")
                     safety_ratings = candidates[0].get("safetyRatings", [])
-                    raise ValueError(f"API响应内容为空(可能被拦截)。原因: {finish_reason}, 安全评级: {safety_ratings}")
+                    raise ValueError(f"API响应内容为空(可能被安全策略拦截)。原因: {finish_reason}, 安全评级: {safety_ratings}")
 
                 json_text = content.get("parts", [{}])[0].get("text")
                 if json_text is None:
                     raise ValueError(f"API响应的 'parts' 中缺少 'text' 字段。响应: {response.text}")
 
+                # 使用 Pydantic 验证 JSON 结构
                 parsed_result = BatchTranscriptionResult.model_validate_json(json_text)
                 subtitles_count = len(parsed_result.subtitles)
                 log_system_event("info", f"✅ [字幕任务 {group_index+1}] 成功！获得 {subtitles_count} 条字幕。", in_worker=True)
                 
+                thread_local_srt_list = []
                 for i, subtitle in enumerate(parsed_result.subtitles):
                     if subtitle.end_ms is None:
                         if i + 1 < subtitles_count:
@@ -676,30 +962,36 @@ def _process_subtitle_batch_with_ai(
                     line = f"{ms_to_srt_time(subtitle.start_ms)} --> {ms_to_srt_time(subtitle.end_ms)}\n{subtitle.text.strip()}\n"
                     thread_local_srt_list.append({"start_ms": subtitle.start_ms, "srt_line": line})
                 
+                # 成功处理，返回结果，函数结束
                 return thread_local_srt_list
 
-            except requests.exceptions.RequestException as e:
-                log_system_event("warning", f"[字幕任务 {group_index+1}] 网络错误 (尝试 {attempt + 1}/{max_retries}): {e}", in_worker=True)
-                if attempt < max_retries - 1: time.sleep(5 * (2 ** attempt))
-            except pydantic.ValidationError as e:
-                log_system_event("error", f"[字幕任务 {group_index+1}] AI返回的JSON格式验证失败，放弃。错误: {e}", in_worker=True)
-                return []
-            except Exception as e:
-                log_system_event("error", f"[字幕任务 {group_index+1}] 不可重试的错误，放弃。错误: {e}", in_worker=True)
-                return []
+            except (requests.exceptions.RequestException, pydantic.ValidationError, ValueError) as e:
+                # 捕获所有预期的、可重试的或不可重试的错误
+                log_system_event("warning", f"[字幕任务 {group_index+1}] 尝试 {attempt + 1}/{max_retries} 失败。错误: {type(e).__name__}: {e}", in_worker=True)
+                last_exception = e
+                if attempt < max_retries - 1:
+                    wait_time = 5 * (2 ** attempt)
+                    log_system_event("info", f"{wait_time}秒后将自动重试...", in_worker=True)
+                    time.sleep(wait_time)
+                else:
+                    # 所有重试次数用尽，跳出循环
+                    break
         
-        raise RuntimeError(f"批次 {group_index+1} 在 {max_retries} 次尝试后仍然失败。")
+        # 如果循环结束（意味着所有重试都失败了），则抛出最后的异常
+        log_system_event("error", f"[字幕任务 {group_index+1}] 在 {max_retries} 次尝试后仍然失败。", in_worker=True)
+        raise RuntimeError(f"批次 {group_index+1} 失败") from last_exception
 
     except Exception as e:
-        log_system_event("error", f"[字幕任务 {group_index+1}] 发生严重错误: {e}", in_worker=True)
-    
-    return thread_local_srt_list
+        # 这是一个最终的捕获器，确保任何未预料到的错误都会被记录并重新抛出
+        log_system_event("critical", f"[字幕任务 {group_index+1}] 发生未预料的严重错误: {type(e).__name__}: {e}", in_worker=True)
+        # 【关键】重新抛出异常，以便 ProcessPoolExecutor 能够捕获到这个任务的失败状态
+        raise e
 
 def run_subtitle_extraction_pipeline(subtitle_config: dict, chunk_files: list[dict], update_status_callback: callable) -> str:
-    #
-    # 主调度器，负责并发处理所有音频批次并生成最终的 SRT 内容。
-    # (优化版：使用 as_completed 提高响应性和健壮性)
-    #
+    """
+    主调度器，负责并发处理所有音频批次并生成最终的 SRT 内容。
+    (优化版 v2: 使用 ProcessPoolExecutor 实现进程隔离，避免线程死锁)
+    """
     
     api_keys = subtitle_config.get('GEMINI_API_KEYS', [])
     prompt_api_url = subtitle_config.get('PROMPT_API_URL', '')
@@ -715,73 +1007,85 @@ def run_subtitle_extraction_pipeline(subtitle_config: dict, chunk_files: list[di
 
     chunk_groups = [chunk_files[i:i + SUBTITLE_BATCH_SIZE] for i in range(0, total_chunks, SUBTITLE_BATCH_SIZE)]
     num_groups = len(chunk_groups)
-    log_system_event("info", f"已将语音片段分为 {num_groups} 个批次，准备并发处理。", in_worker=True)
+    log_system_event("info", f"已将语音片段分为 {num_groups} 个批次，准备通过多进程并发处理。", in_worker=True)
     update_status_callback(stage="subtitle_transcribing", details=f"准备处理 {num_groups} 个字幕批次...")
     
     all_srt_blocks = []
     
-    # 从 concurrent.futures 导入 as_completed
-    from concurrent.futures import as_completed
-
-    with ThreadPoolExecutor(max_workers=SUBTITLE_CONCURRENT_REQUESTS) as executor:
+    # 【核心修改】: 使用 ProcessPoolExecutor 替代 ThreadPoolExecutor
+    # max_workers 建议不要设置得过高，因为它会消耗更多内存。4-8个进程通常是比较好的起点。
+    # SUBTITLE_CONCURRENT_REQUESTS 这个全局变量的值可以根据情况调整。
+    with ProcessPoolExecutor(max_workers=SUBTITLE_CONCURRENT_REQUESTS) as executor:
         # 使用字典将 future 映射回其任务索引，便于日志记录
         future_to_index = {}
         delay_between_submissions = 60.0 / SUBTITLE_REQUESTS_PER_MINUTE
         
-        log_system_event("info", "开始向线程池提交所有字幕任务...", in_worker=True)
+        log_system_event("info", "开始向进程池提交所有字幕任务...", in_worker=True)
         for i, group in enumerate(chunk_groups):
-            api_key_for_thread = api_keys[i % len(api_keys)]
+            api_key_for_process = api_keys[i % len(api_keys)]
             future = executor.submit(
                 _process_subtitle_batch_with_ai,
                 group,
                 i, # 任务索引
-                api_key_for_thread,
+                api_key_for_process,
                 gemini_endpoint_prefix,
                 prompt_api_url
             )
             future_to_index[future] = i + 1  # 任务索引从1开始，更符合日志习惯
             
-            # 在提交循环之间短暂暂停，以平滑请求速率
             if i < num_groups - 1:
                 time.sleep(delay_between_submissions)
         
         log_system_event("info", f"所有 {num_groups} 个任务均已提交。现在开始等待并处理返回结果...", in_worker=True)
         
-        # 使用 as_completed 迭代，哪个任务先完成就先处理哪个
-        # 这样可以避免被单个缓慢的任务阻塞整个流程
         completed_count = 0
         for future in as_completed(future_to_index):
             task_index = future_to_index[future]
             completed_count += 1
             
             try:
-                # 获取已完成任务的结果
-                result = future.result()
+                # 【新增】为获取结果设置一个合理的超时时间（例如15分钟）
+                # 这个时间应该大于单个批次处理的最大可能时间（包括重试）
+                # timeout = (单个请求超时 + 重试等待) * 重试次数，再加一些余量
+                # timeout = (360s + 5s*1 + 5s*2) * 3 = (375s) * 3 ~= 20分钟
+                result_timeout = 10 * 60 # 20分钟
+                
+                # 获取已完成任务的结果。如果子进程中发生异常，.result()会重新抛出它
+                result = future.result(timeout=result_timeout)
+                
                 if result:
                     all_srt_blocks.extend(result)
-                    log_system_event("info", f"已成功处理完字幕任务 {task_index} 的结果。", in_worker=True)
+                    log_system_event("info", f"✅ 已成功处理完字幕任务 {task_index} 的结果。", in_worker=True)
                 else:
-                    # 如果结果为空列表，说明该批次处理失败但被优雅捕获了
-                    log_system_event("warning", f"字幕任务 {task_index} 返回了空结果，可能在处理过程中失败。", in_worker=True)
+                    # 这种情况理论上不应该发生，除非_process_subtitle_batch_with_ai在没有结果时返回了None或[]
+                    log_system_event("warning", f"字幕任务 {task_index} 返回了空结果，可能处理失败但未抛出异常。", in_worker=True)
 
-                # 更新状态回调，显示处理进度
-                update_status_callback(stage="subtitle_transcribing", details=f"已处理完 {completed_count}/{num_groups} 个字幕批次...")
-            
+            except TimeoutError:
+                # 【新增】捕获超时错误
+                log_system_event("error", f"❌ 获取字幕任务 {task_index} 的结果超时！该子进程可能已僵死。", in_worker=True)
+                # 即使一个任务超时，我们依然要继续处理其他已完成的任务
+                
             except Exception as e:
-                # 捕获在 future.result() 期间可能抛出的任何异常
-                log_system_event("error", f"获取字幕任务 {task_index} 的结果时发生严重错误: {e}", in_worker=True)
-                # 即使一个任务失败，我们依然更新进度并继续处理其他任务
-                update_status_callback(stage="subtitle_transcribing", details=f"处理任务 {task_index} 失败，已处理 {completed_count}/{num_groups} 个批次...")
+                # 【关键】现在可以正确捕获子进程中的所有异常
+                log_system_event("error", f"❌ 获取字幕任务 {task_index} 的结果时发生严重错误: {e}", in_worker=True)
+            
+            finally:
+                # 无论成功失败，都更新进度
+                update_status_callback(stage="subtitle_transcribing", details=f"已处理 {completed_count}/{num_groups} 个字幕批次...")
 
     log_system_event("info", "所有并发任务处理完成，正在整合字幕...", in_worker=True)
     
-    # 最终的排序逻辑保持不变，这是保证字幕顺序正确的关键
+    if not all_srt_blocks:
+        log_system_event("warning", "所有字幕批次处理均失败或未返回任何内容，最终生成的字幕为空。", in_worker=True)
+        # 根据业务需求，可以选择返回空字符串或抛出异常
+        # 这里选择返回空字符串，让主流程判断
+        return ""
+
     all_srt_blocks.sort(key=lambda x: x["start_ms"])
     
-    # 拼接成最终的SRT文件内容
     final_srt_lines = [f"{i + 1}\n{block['srt_line']}" for i, block in enumerate(all_srt_blocks)]
-    
     final_srt_content = "\n".join(final_srt_lines)
+    
     log_system_event("info", f"字幕整合完成，共生成 {len(all_srt_blocks)} 条字幕。", in_worker=True)
     
     return final_srt_content
@@ -792,11 +1096,14 @@ def run_subtitle_extraction_pipeline(subtitle_config: dict, chunk_files: list[di
 
 class MixFileCLIClient:
     # 一个简单的用于与 MixFileCLI 后端 API 交互的客户端。
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, proxies: dict = None):
         if not base_url.startswith("http"):
             raise ValueError("Base URL 必须以 http 或 https 开头")
         self.base_url = base_url
         self.session = requests.Session()
+        # 【核心修改】设置代理
+        if proxies:
+            self.session.proxies = proxies
 
     def _make_request(self, method: str, url: str, **kwargs):
         # 统一的请求发送方法，包含错误处理。
@@ -806,7 +1113,8 @@ class MixFileCLIClient:
             headers.update({'Cache-Control': 'no-cache', 'Pragma': 'no-cache'})
             kwargs['headers'] = headers
             
-            response = self.session.request(method, url, timeout=300, **kwargs)
+            # 使用更长的超时时间以适应慢速网络
+            response = self.session.request(method, url, timeout=600, **kwargs)
             response.raise_for_status()
             return response
         except requests.exceptions.RequestException as e:
@@ -819,7 +1127,7 @@ class MixFileCLIClient:
 
     def upload_file(self, local_file_path: str, progress_callback: callable = None):
         #
-        # 上传单个文件并获取分享码。
+        # 【修改后】上传单个文件并获取分享码，增加了进度回调功能。
         #
         # Args:
         #     local_file_path (str): 本地文件的完整路径。
@@ -830,8 +1138,14 @@ class MixFileCLIClient:
         #
         filename = os.path.basename(local_file_path)
         upload_url = urljoin(self.base_url, f"/api/upload/{quote(filename)}")
-        file_size = os.path.getsize(local_file_path)
+        
+        try:
+            file_size = os.path.getsize(local_file_path)
+        except OSError as e:
+             # 如果文件在这里就找不到了，直接返回错误
+            return (404, f"File not found: {e}")
 
+        # 【核心修改】创建一个生成器，它在读取文件的同时调用回调函数
         def file_reader_generator(file_handle):
             chunk_size = 1 * 1024 * 1024 # 1MB chunk
             bytes_read = 0
@@ -846,8 +1160,12 @@ class MixFileCLIClient:
                     progress_callback(bytes_read, file_size)
                 yield chunk
 
-        with open(local_file_path, 'rb') as f:
-            return self._make_request("PUT", upload_url, data=file_reader_generator(f))
+        try:
+            with open(local_file_path, 'rb') as f:
+                # 将生成器作为 data 传递
+                return self._make_request("PUT", upload_url, data=file_reader_generator(f))
+        except FileNotFoundError as e:
+            return (404, str(e))
 
 # =============================================================================
 # --- 第 6 步: 统一的 Flask API 服务 (主进程) ---
@@ -856,7 +1174,8 @@ class MixFileCLIClient:
 # --- A. 应用初始化与任务管理 ---
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False
-
+# 全局代理配置，将在main函数中被设置
+GLOBAL_PROXY_SETTINGS = None
 # 使用字典来存储所有异步任务的状态，并用锁来保证线程安全
 tasks = {}
 tasks_lock = threading.Lock()
@@ -870,6 +1189,9 @@ RESULT_QUEUE = None # 多进程结果队列
 
 # --- B. API 路由定义 ---
 
+# =============================================================================
+# --- (方法1/3) unified_upload_endpoint [修改后] ---
+# =============================================================================
 @app.route("/api/upload", methods=["POST"])
 def unified_upload_endpoint():
     #
@@ -883,7 +1205,7 @@ def unified_upload_endpoint():
 
     task_id = str(uuid.uuid4())
     
-    # 从请求中提取参数，并设置默认值
+    # 从请求中提取参数
     request_params = {
         "url": data["url"],
         "extract_subtitle": data.get("extract_subtitle", False),
@@ -891,34 +1213,48 @@ def unified_upload_endpoint():
         "upload_subtitle": data.get("upload_subtitle", False),
     }
 
-    # 初始化任务状态
+    # 【核心修改】初始化新的、面板友好的任务状态结构
     with tasks_lock:
         tasks[task_id] = {
-            "task_id": task_id,
-            "status": "pending",
-            "stage": "queue",
-            "details": "任务已创建，等待处理",
+            "taskId": task_id,
+            "status": "QUEUED",
             "progress": 0,
-            "result": None
+            "error": None,
+            "results": {
+                "video": {
+                    "status": "PENDING" if request_params["upload_video"] else "SKIPPED",
+                    "details": "等待处理" if request_params["upload_video"] else "用户未请求此操作",
+                    "output": None,
+                    "error": None
+                },
+                "subtitle": {
+                    "status": "PENDING" if request_params["extract_subtitle"] else "SKIPPED",
+                    "details": "等待处理" if request_params["extract_subtitle"] else "用户未请求此操作",
+                    "output": None,
+                    "error": None
+                }
+            },
+            "createdAt": time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime()),
+            "updatedAt": time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
         }
 
-    # 【核心修改】将任务数据放入队列，由子进程处理
+    # 将任务数据放入队列，由子进程处理
     task_data = {
         'task_id': task_id,
         'params': request_params,
-        'subtitle_config': subtitle_config_global, # 传递必要的配置
+        'subtitle_config': subtitle_config_global,
         'api_client_base_url': api_client.base_url,
-        'frp_server_addr': FRP_SERVER_ADDR # 传递FRP地址用于构建链接
+        'frp_server_addr': FRP_SERVER_ADDR
     }
     TASK_QUEUE.put(task_data)
     
     log_system_event("info", f"已创建新任务 {task_id} 并推入处理队列。")
 
+    # 返回体保持不变，依然简洁
     return jsonify({
         "task_id": task_id,
         "status_url": f"/api/tasks/{task_id}"
     }), 202
-
 
 @app.route("/api/tasks/<task_id>", methods=["GET"])
 def get_task_status_endpoint(task_id):
@@ -982,297 +1318,420 @@ def force_shutdown_endpoint():
 # --- 第 7 步: 高容错的统一任务处理器 (在子进程中运行) ---
 # =============================================================================
 
-def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, ai_models: dict):
-    #
-    # 处理一个完整的媒体任务，包含下载、字幕提取和上传等步骤。
-    # 这个函数实现了方案2的核心逻辑：子任务的独立失败处理。
-    #
-    
-    # --- 1. 初始化 ---
+def process_unified_task(task_data: dict, result_queue: multiprocessing.Queue, upload_queue: multiprocessing.Queue, subtitle_config: dict, ai_models: dict):
+    """
+    【并行优化最终版】将ffmpeg提取音频与后续处理拆分，实现视频上传与音频处理的最大化并行。
+    """
     task_id = task_data['task_id']
     params = task_data['params']
-    subtitle_config = task_data['subtitle_config']
-    api_client_base_url = task_data['api_client_base_url']
-    frp_server_addr = task_data['frp_server_addr']
-    
-    # 在子进程中重新创建api_client
-    local_api_client = MixFileCLIClient(base_url=api_client_base_url)
-
     temp_dir = Path(f"/kaggle/working/task_{task_id}")
     temp_dir.mkdir(exist_ok=True)
     
-    # 定义一个内部函数来更新任务状态，通过队列发送给主进程
-    def _update_status(status, stage, details, progress=None):
-        update_data = {
-            'type': 'status_update',
-            'task_id': task_id,
-            'payload': {
-                'status': status,
-                'stage': stage,
-                'details': details,
-            }
+    # ... [内部状态 _internal_status 和 _update_status 函数保持不变] ...
+    _internal_status = {
+        "progress": 0,
+        "results": {
+            "video": {"status": "PENDING", "details": "准备中", "output": None, "error": None},
+            "subtitle": {"status": "PENDING", "details": "准备中", "output": None, "error": None}
         }
-        if progress is not None:
-            update_data['payload']['progress'] = progress
-        result_queue.put(update_data)
-
-    
-    # 初始化最终结果结构
-    final_result = {
-        "video_file": {"status": "pending"},
-        "subtitle_file": {"status": "pending"}
     }
+    def _update_status(component=None, status=None, details=None, progress_val=None, output=None, error_obj=None):
+        payload = {'type': 'status_update', 'task_id': task_id, 'payload': {}}
+        update_target = {}
+        if component and component in _internal_status["results"]:
+            update_target = _internal_status["results"][component]
+            partial_update = {}
+            if status: update_target["status"] = status; partial_update['status'] = status
+            if details: update_target["details"] = details; partial_update['details'] = details
+            if output:
+                if update_target.get("output") is None: update_target["output"] = {}
+                update_target["output"].update(output)
+                partial_update['output'] = update_target['output']
+            if error_obj: update_target["error"] = error_obj; partial_update['error'] = error_obj
+            payload['payload']['results'] = {component: partial_update}
+        if progress_val is not None:
+            _internal_status["progress"] = progress_val
+            payload['payload']['progress'] = _internal_status['progress']
+        if payload['payload']:
+             result_queue.put(payload)
 
     try:
-        # --- 2. 子任务: 下载源文件 ---
-        _update_status("running", "download", "准备从 URL 下载文件...", 0)
-        
+        # --- 步骤 1: 下载文件 ---
+        _update_status(component="video", status="RUNNING", details="开始下载文件...", progress_val=5)
+        _update_status(component="subtitle", status="RUNNING", details="等待视频下载...")
         file_url = params['url']
-        # 从URL猜测文件名，并进行清理
-        filename_encoded = file_url.split("/")[-1].split("?")[0] or f"downloaded_file_{task_id}"
-        filename = unquote(filename_encoded)
+        filename = unquote(file_url.split("/")[-1].split("?")[0] or f"file_{task_id}")
         local_file_path = temp_dir / filename
-        final_result["video_file"]["filename"] = filename
-
-        bytes_downloaded = 0
         with requests.get(file_url, stream=True, timeout=60) as r:
             r.raise_for_status()
             total_size = int(r.headers.get('content-length', 0))
+            bytes_downloaded = 0
             with open(local_file_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
                     bytes_downloaded += len(chunk)
                     if total_size > 0:
-                        progress = round((bytes_downloaded / total_size) * 100, 2)
-                        _update_status("running", "download", f"已下载 {bytes_downloaded}/{total_size} 字节", progress)
-        
-        # --- 3. 子任务: 媒体类型验证 ---
-        _update_status("running", "validate", "正在验证文件类型...", 100)
-        is_video = False
-        mime_type, _ = mimetypes.guess_type(local_file_path)
-        if mime_type and mime_type.startswith("video"):
-            is_video = True
-            log_system_event("info", f"文件 {filename} 被识别为视频 ({mime_type})。", in_worker=True)
-        else:
-            log_system_event("warning", f"文件 {filename} 不是标准视频格式 ({mime_type})。", in_worker=True)
+                        dl_progress = round((bytes_downloaded / total_size) * 100)
+                        _update_status(component="video", details=f"下载中 ({dl_progress}%)...", progress_val=5 + int(dl_progress * 0.2))
+        _update_status(component="video", details="下载完成")
 
-        # --- 4. 子任务: 字幕提取 ---
-        srt_content = None
+        # --- 步骤 2: (如果需要) 串行执行冲突的 ffmpeg 音频提取 ---
+        raw_audio_path_for_subtitle = None
         if params["extract_subtitle"]:
-            if is_video:
+            mime_type, _ = mimetypes.guess_type(local_file_path)
+            if not (mime_type and mime_type.startswith("video")):
+                _update_status(component="subtitle", status="SKIPPED", details="源文件不是视频格式")
+            else:
                 try:
-                    _update_status("running", "subtitle_extraction", "字幕提取流程已启动...", 0)
-                    # 调用完整的字幕提取管道
-                    # 创建一个局部lambda，因为它不能被pickle传递
-                    update_callback_for_sub = lambda stage, details: _update_status("running", stage, details)
-                    audio_chunks = preprocess_audio_for_subtitles(local_file_path, temp_dir, update_callback_for_sub, ai_models)
-                    srt_content = run_subtitle_extraction_pipeline(subtitle_config, audio_chunks, update_callback_for_sub)
-                    if srt_content:
-                        srt_filename = local_file_path.stem + ".srt"
-                        final_result["subtitle_file"]["filename"] = srt_filename
-                        final_result["subtitle_file"]["status"] = "success"
-                        
-                        # 返回Base64编码的SRT文件
-                        srt_base64 = base64.b64encode(srt_content.encode('utf-8')).decode('utf-8')
-                        final_result["subtitle_file"]["content_base64"] = srt_base64
-                        
-                        # 将SRT文件保存到本地以备上传
-                        with open(temp_dir / srt_filename, "w", encoding="utf-8") as f:
-                            f.write(srt_content)
-                    else:
-                        raise RuntimeError("未检测到有效语音，无法生成字幕。")
-
+                    def sub_progress_callback(stage, details): _update_status(component="subtitle", details=details)
+                    # 只执行第一步提取，完成后视频文件即被释放
+                    raw_audio_path_for_subtitle = extract_audio_with_ffmpeg(local_file_path, temp_dir, sub_progress_callback)
                 except Exception as e:
-                    log_system_event("error", f"任务 {task_id} 的字幕提取失败: {e}", in_worker=True)
-                    final_result["subtitle_file"]["status"] = "failed"
-                    final_result["subtitle_file"]["details"] = f"字幕提取失败: {str(e)}"
-            else:
-                final_result["subtitle_file"]["status"] = "skipped"
-                final_result["subtitle_file"]["details"] = "源文件不是有效的视频格式"
+                    _update_status(component="subtitle", status="FAILED", details=f"音频提取失败: {e}", error_obj={"code": "AUDIO_EXTRACTION_FAILED", "message": str(e)})
         else:
-            final_result["subtitle_file"]["status"] = "skipped"
-            final_result["subtitle_file"]["details"] = "未请求提取字幕"
+            _update_status(component="subtitle", status="SKIPPED", details="用户未请求提取")
 
-        # --- 5. 子任务: 文件上传 (使用并发) ---
-        _update_status("running", "uploading", "准备上传文件到 MixFile...", 0)
-        
-        upload_tasks = []
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            # 提交视频上传任务
-            if params["upload_video"]:
-                upload_tasks.append(executor.submit(local_api_client.upload_file, str(local_file_path)))
-            else:
-                final_result["video_file"]["status"] = "skipped"
+        # --- 步骤 3: 并行执行视频上传和后续音频处理 ---
+        # 此时 ffmpeg 已结束，视频文件已释放，可以安全地派发上传任务
+        if params["upload_video"]:
+            _update_status(component="video", status="RUNNING", details="已派发上传任务", progress_val=35)
+            upload_queue.put({
+                'task_id': task_id, 'component': 'video', 'local_file_path': str(local_file_path),
+                'filename_for_link': filename, 'api_client_base_url': task_data['api_client_base_url'],
+                'frp_server_addr': task_data['frp_server_addr']
+            })
+        else:
+            _update_status(component="video", status="SKIPPED", details="用户未请求上传")
 
-            # 提交字幕上传任务
-            if params["upload_subtitle"] and srt_content:
-                srt_path = temp_dir / final_result["subtitle_file"]["filename"]
-                upload_tasks.append(executor.submit(local_api_client.upload_file, str(srt_path)))
-        
-        # 处理上传结果
-        for future in upload_tasks:
+        # 同时，如果第一步音频提取成功，则开始进行后续的、不冲突的音频处理和AI流程
+        if raw_audio_path_for_subtitle:
             try:
-                # 假设 upload_file 成功时返回 Response，失败时返回 tuple
-                response = future.result()
+                def sub_progress_callback(stage, details): _update_status(component="subtitle", details=details)
+                # 第二步：处理已提取的音频
+                audio_chunks = preprocess_audio_for_subtitles(raw_audio_path_for_subtitle, temp_dir, sub_progress_callback, ai_models)
                 
-                is_srt_upload = False
-                if hasattr(response, 'request') and response.request is not None and response.request.url is not None:
-                     if ".srt" in unquote(response.request.url):
-                        is_srt_upload = True
-
-                if isinstance(response, requests.Response) and response.ok:
-                    share_code = response.text.strip()
-                    if is_srt_upload:
-                        target_result = final_result["subtitle_file"]
-                    else:
-                        target_result = final_result["video_file"]
-                    
-                    target_result["status"] = "success"
-                    target_result["share_code"] = share_code
-                    target_result["share_link"] = f"http://{frp_server_addr}:{MIXFILE_REMOTE_PORT}/api/download/{quote(target_result['filename'])}?s={share_code}"
+                # 第三步：AI字幕生成
+                _update_status(component="subtitle", status="RUNNING", details="AI处理中...", progress_val=40)
+                srt_content = run_subtitle_extraction_pipeline(subtitle_config, audio_chunks, sub_progress_callback)
+                
+                if not srt_content: raise RuntimeError("未能生成有效的字幕内容。")
+                
+                srt_base64 = base64.b64encode(srt_content.encode('utf-8')).decode('utf-8')
+                _update_status(component="subtitle", output={"contentBase64": srt_base64})
+                
+                if params["upload_subtitle"]:
+                    _update_status(component="subtitle", status="RUNNING", details="已派发字幕上传任务")
+                    srt_filename = local_file_path.stem + ".srt"
+                    srt_path = temp_dir / srt_filename
+                    with open(srt_path, "w", encoding="utf-8") as f: f.write(srt_content)
+                    upload_queue.put({
+                       'task_id': task_id, 'component': 'subtitle', 'local_file_path': str(srt_path),
+                       'filename_for_link': srt_filename, 'api_client_base_url': task_data['api_client_base_url'],
+                       'frp_server_addr': task_data['frp_server_addr']
+                    })
                 else:
-                    status_code, error_text = response if isinstance(response, tuple) else (response.status_code, response.text)
-                    raise RuntimeError(f"上传失败。状态码: {status_code}, 错误: {error_text}")
-
+                    _update_status(component="subtitle", status="SUCCESS", details="提取成功")
             except Exception as e:
-                log_system_event("error", f"任务 {task_id} 的文件上传失败: {e}", in_worker=True)
-                if final_result["video_file"]["status"] == "pending":
-                    final_result["video_file"]["status"] = "failed"
-                    final_result["video_file"]["details"] = str(e)
-                if final_result["subtitle_file"].get("status") == "success" and "share_code" not in final_result["subtitle_file"]:
-                    final_result["subtitle_file"]["status"] = "upload_failed"
-                    final_result["subtitle_file"]["details"] = str(e)
+                _update_status(component="subtitle", status="FAILED", details=str(e), error_obj={"code": "SUBTITLE_PIPELINE_FAILED", "message": str(e)})
 
-        # --- 6. 任务完成 ---
-        result_data = {
-            'type': 'task_result',
-            'task_id': task_id,
-            'status': 'success',
-            'result': final_result,
-            'details': '任务处理完成'
-        }
-        result_queue.put(result_data)
-            
+        log_system_event("info", f"媒体处理进程为任务 {task_id} 的主要工作已完成。", in_worker=True)
+
     except Exception as e:
         log_system_event("error", f"处理任务 {task_id} 时发生严重错误: {e}", in_worker=True)
-        result_data = {
-            'type': 'task_result',
-            'task_id': task_id,
-            'status': 'failed',
-            'result': final_result, # 即使失败也返回部分结果
-            'details': str(e)
-        }
-        result_queue.put(result_data)
+        result_queue.put({'type': 'task_result', 'task_id': task_id, 'status': 'FAILED', 'result': {}, 'error': {"code": "FATAL_ERROR", "message": str(e)}})
     finally:
-        # --- 7. 清理临时文件 ---
-        try:
-            shutil.rmtree(temp_dir)
-            log_system_event("info", f"已清理任务 {task_id} 的临时目录。", in_worker=True)
-        except Exception as e:
-            log_system_event("error", f"清理任务 {task_id} 的临时目录失败: {e}", in_worker=True)
+        log_system_event("info", f"媒体处理进程 {task_id} 完成，不再清理主任务目录。", in_worker=True)
 
 # =============================================================================
 # --- 第 8 步: 多进程 Worker 与主程序 ---
 # =============================================================================
 
-def worker_process_loop(task_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue):
+
+# =============================================================================
+# --- (新增方法 1/3) uploader_process_loop [全新] ---
+# =============================================================================
+
+# 这个新函数专门负责文件上传，运行在独立的进程中
+def uploader_process_loop(upload_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue):
     """
-    这是一个在独立子进程中运行的循环。
-    它持续从任务队列中获取任务，调用处理器，并将结果放入结果队列。
+    【重构版】上传工作进程，实现按任务(task_id)进行一次性的按需测速和代理管理。
+    """
+    log_system_event("info", "上传专用工作进程已启动。", in_worker=True)
+    task_proxy_cache = {}  # key: task_id, value: {'proxies': ..., 'config': ...}
+
+    # 在循环外初始化一次 ProxyManager
+    proxy_manager = ProxyManager(subtitle_config_global.get("V2RAY_SUB_URL"))
+    xray_process = None
+
+    def start_xray_for_task(config):
+        nonlocal xray_process
+        if xray_process:
+            xray_process.terminate()
+            xray_process.wait()
+        
+        config_path = Path("/kaggle/working/xray_final_config.json")
+        with open(config_path, 'w') as f:
+            json.dump(config, f)
+        
+        xray_process = run_command(f"{proxy_manager.xray_path} -c {config_path}", "xray_upload.log")
+        if not wait_for_port(proxy_manager.local_socks_port, host='127.0.0.1', timeout=10):
+            log_system_event("error", "启动最优代理节点用于上传失败！", in_worker=True)
+            return False
+        return True
+
+    try:
+        while True:
+            try:
+                upload_task_data = upload_queue.get()
+                if upload_task_data is None:
+                    break
+
+                task_id = upload_task_data['task_id']
+                component = upload_task_data['component']
+                local_file_path_str = upload_task_data['local_file_path']
+                api_client_base_url = upload_task_data['api_client_base_url']
+                
+                # --- 按需测速与代理选择 ---
+                if task_id not in task_proxy_cache:
+                    proxies_for_task, config_for_task = proxy_manager.get_best_proxy_for_upload(api_client_base_url)
+                    task_proxy_cache[task_id] = {'proxies': proxies_for_task, 'config': config_for_task}
+                    
+                    if config_for_task:
+                        if not start_xray_for_task(config_for_task):
+                            # 启动失败，本次任务回退到直连
+                            task_proxy_cache[task_id]['proxies'] = None
+                    elif xray_process: # 如果之前有代理在运行，但这次是直连，则关闭它
+                        xray_process.terminate()
+                        xray_process.wait()
+                        xray_process = None
+
+                current_proxies = task_proxy_cache[task_id]['proxies']
+                
+                # ... (后续的上传逻辑，从 _update_uploader_status 定义开始，保持不变) ...
+                def _update_uploader_status(status, details=None, output=None, error_obj=None):
+                    payload_results = {component: {}}
+                    if status: payload_results[component]['status'] = status
+                    if details: payload_results[component]['details'] = details
+                    if output: payload_results[component]['output'] = output
+                    if error_obj: payload_results[component]['error'] = error_obj
+                    result_queue.put({'type': 'status_update', 'task_id': task_id, 'payload': {'results': payload_results}})
+
+                try:
+                    filename_for_link = upload_task_data['filename_for_link']
+                    frp_server_addr = upload_task_data['frp_server_addr']
+                    
+                    # 使用当前任务缓存的代理配置创建客户端
+                    api_client = MixFileCLIClient(base_url=api_client_base_url, proxies=current_proxies)
+                    log_system_event("info", f"[上传进程] [{component}] 开始处理上传任务 (代理: {'启用' if current_proxies else '禁用'})...", in_worker=True)
+
+                    _update_uploader_status("RUNNING", details="正在上传 (0%)...")
+                    
+                    last_reported_percent = -1
+                    def progress_callback(bytes_uploaded, total_bytes):
+                        nonlocal last_reported_percent
+                        if total_bytes > 0:
+                            percent = int((bytes_uploaded / total_bytes) * 100)
+                            if percent > last_reported_percent and (percent % 5 == 0 or percent == 100):
+                                _update_uploader_status("RUNNING", details=f"正在上传 ({percent}%)")
+                                last_reported_percent = percent
+                    
+                    response = api_client.upload_file(local_file_path_str, progress_callback=progress_callback)
+                    
+                    if isinstance(response, requests.Response):
+                        if response.ok:
+                            share_code = response.text.strip()
+                            share_url = f"http://{frp_server_addr}:{MIXFILE_REMOTE_PORT}/api/download/{quote(filename_for_link)}?s={share_code}"
+                            _update_uploader_status("SUCCESS", details="上传成功", output={"shareUrl": share_url})
+                            log_system_event("info", f"✅ [上传进程] [{component}] 上传成功。", in_worker=True)
+                        else:
+                            raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
+                    elif isinstance(response, tuple):
+                        raise RuntimeError(f"请求失败 (状态码 {response[0]}): {response[1]}")
+                    else:
+                        raise RuntimeError(f"MixFile客户端返回了未知类型: {type(response)}")
+
+                except Exception as e:
+                    log_system_event("error", f"❌ [上传进程] [{component}] 上传任务发生严重错误: {e}", in_worker=True)
+                    _update_uploader_status("FAILED", details=f"上传失败: {e}", error_obj={"code": "UPLOAD_FAILED", "message": str(e)})
+
+                finally:
+                    try:
+                        Path(local_file_path_str).unlink(missing_ok=True)
+                    except OSError as e:
+                        log_system_event("warning", f"[上传进程] [{component}] 清理文件 {local_file_path_str} 失败: {e}", in_worker=True)
+                    
+                    # 检查是否是该任务的最后一个上传组件，如果是，则清理缓存
+                    # 这是一个简单的检查，可以根据需要做得更复杂
+                    if component == 'subtitle': # 假设字幕总是最后一个
+                        log_system_event("info", f"任务 {task_id} 上传完成，清理代理缓存。", in_worker=True)
+                        del task_proxy_cache[task_id]
+                        if xray_process:
+                           xray_process.terminate()
+                           xray_process.wait()
+                           xray_process = None
+
+            except QueueEmpty:
+                continue
+            except Exception as e:
+                log_system_event("critical", f"上传专用工作进程循环发生内部错误: {e}", in_worker=True)
+    finally:
+        if xray_process:
+            xray_process.terminate()
+            xray_process.wait()
+        log_system_event("info", "上传专用工作进程已关闭。", in_worker=True)
+
+def worker_process_loop(task_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue, upload_queue: multiprocessing.Queue):
+    """
+    媒体处理工作进程循环，负责媒体处理并将上传任务外包。
     """
     log_system_event("info", "媒体处理工作进程已启动。", in_worker=True)
-    # <--- 修改开始 --->
-    # 在进入任务循环前，预加载所有AI模型
-    ai_models = load_ai_models() 
-
+    ai_models = load_ai_models()
+    # subtitle_config_global 是在main函数中解密的全局变量，子进程可以直接访问
+    
     while True:
         try:
             task_data = task_queue.get()
-            if task_data is None: # 收到终止信号
+            if task_data is None:
                 break
-            log_system_event("info", f"工作进程接收到新任务: {task_data['task_id']}", in_worker=True)
-            # 将预加载的模型传递给任务处理器
-            process_unified_task(task_data, result_queue, ai_models)
-        # <--- 修改结束 --->
+            log_system_event("info", f"媒体处理进程接收到新任务: {task_data['task_id']}", in_worker=True)
+            process_unified_task(task_data, result_queue, upload_queue, subtitle_config_global, ai_models)
         except KeyboardInterrupt:
             break
         except Exception as e:
-            # 捕获循环中的意外错误，防止子进程崩溃
-            log_system_event("critical", f"工作进程循环发生严重错误: {e}", in_worker=True)
+            log_system_event("critical", f"媒体处理工作进程循环发生严重错误: {e}", in_worker=True)
     log_system_event("info", "媒体处理工作进程已关闭。", in_worker=True)
 
 def result_processor_thread_loop(result_queue: multiprocessing.Queue):
     """
-    这是一个在主进程中运行的后台线程。
-    它持续从结果队列中获取来自子进程的数据，并更新主进程中的任务状态字典。
+    【修改后】结果处理器，增加了在任务达到最终状态后，负责清理任务临时目录的逻辑。
     """
     log_system_event("info", "结果处理线程已启动。")
     while True:
         try:
-            # 使用带超时的get，防止永久阻塞，允许未来加入优雅退出逻辑
-            result_data = result_queue.get(timeout=3600) 
-            
+            # 使用长超时以防队列长时间空闲
+            result_data = result_queue.get(timeout=3600)
             task_id = result_data['task_id']
+
             with tasks_lock:
                 if task_id not in tasks:
-                    continue # 如果任务已被清除，则忽略
+                    continue
 
-                data_type = result_data['type']
+                task = tasks[task_id]
+                task['updatedAt'] = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
+                
+                data_type = result_data.get('type')
+                
+                # --- 状态更新逻辑 ---
                 if data_type == 'status_update':
-                    payload = result_data['payload']
-                    tasks[task_id].update(payload)
+                    payload = result_data.get('payload', {})
+                    if 'progress' in payload: task['progress'] = payload['progress']
+                    if 'results' in payload:
+                        for component, data in payload['results'].items():
+                            if component in task['results']:
+                                task['results'][component].update(data)
+                    # 只要有更新，就认为是RUNNING（除非已经是最终状态）
+                    if task['status'] not in ["SUCCESS", "FAILED", "PARTIAL_SUCCESS"]:
+                         task['status'] = "RUNNING"
 
+                # --- 任务级结果（通常是严重错误） ---
                 elif data_type == 'task_result':
-                    tasks[task_id]['status'] = result_data['status']
-                    tasks[task_id]['result'] = result_data['result']
-                    tasks[task_id]['details'] = result_data['details']
-                    tasks[task_id]['progress'] = 100
-                    log_system_event("info", f"任务 {task_id} 已完成，状态: {result_data['status']}.")
-        
+                    task['status'] = result_data.get('status', 'FAILED')
+                    task['error'] = result_data.get('error')
+                    task['progress'] = 100
+                
+                # --- 检查任务是否已达到最终状态 ---
+                video_status = task['results']['video']['status']
+                subtitle_status = task['results']['subtitle']['status']
+                
+                # 检查所有子组件是否都已脱离“处理中”的状态
+                is_finished = "PENDING" not in (video_status, subtitle_status) and \
+                              "RUNNING" not in (video_status, subtitle_status)
+
+                # 如果任务已完成，并且尚未设置最终状态，则进行评估和清理
+                if is_finished and task['status'] not in ["SUCCESS", "FAILED", "PARTIAL_SUCCESS"]:
+                    log_system_event("info", f"任务 {task_id} 所有组件已完成，正在进行最终状态评估。")
+                    task['progress'] = 100
+                    
+                    # 状态清理：处理因进程崩溃导致的 "RUNNING" 残留状态
+                    for component in task['results']:
+                        comp_data = task['results'][component]
+                        if comp_data['status'] == 'RUNNING':
+                            comp_data['status'] = 'FAILED'
+                            comp_data['details'] = '组件因未知原因未能完成'
+                            comp_data['error'] = { 'code': 'WORKER_CRASHED', 'message': '处理此组件的工作进程可能已意外终止。'}
+
+                    # 重新获取清理后的状态
+                    final_video_status = task['results']['video']['status']
+                    final_subtitle_status = task['results']['subtitle']['status']
+                    
+                    # 定义参与最终状态评估的状态列表 (排除 SKIPPED)
+                    active_statuses = [s for s in (final_video_status, final_subtitle_status) if s != "SKIPPED"]
+                    
+                    if not active_statuses: # 如果所有组件都被跳过
+                        task['status'] = "SUCCESS"
+                    elif all(s == "SUCCESS" for s in active_statuses):
+                        task['status'] = "SUCCESS"
+                    elif "FAILED" in active_statuses:
+                        if "SUCCESS" in active_statuses:
+                            task['status'] = "PARTIAL_SUCCESS"
+                        else:
+                            task['status'] = "FAILED"
+                    else: # 其他情况，例如全是SKIPPED和SUCCESS
+                        task['status'] = "SUCCESS"
+
+                    log_system_event("info", f"任务 {task_id} 最终状态被设置为: {task['status']}")
+
+                    # 【核心新增】在此处执行清理操作
+                    temp_dir_to_clean = Path(f"/kaggle/working/task_{task_id}")
+                    if temp_dir_to_clean.exists():
+                        log_system_event("info", f"任务 {task_id} 已结束，准备清理临时目录: {temp_dir_to_clean}")
+                        try:
+                            shutil.rmtree(temp_dir_to_clean)
+                            log_system_event("info", f"✅ 成功清理任务 {task_id} 的临时目录。")
+                        except Exception as e:
+                            log_system_event("error", f"❌ 清理任务 {task_id} 的临时目录失败: {e}")
+
         except QueueEmpty:
-            continue # 超时是正常情况，继续循环
+            # 队列为空是正常情况，继续循环
+            continue
         except Exception as e:
-            log_system_event("error", f"结果处理线程发生错误: {e}")
+            log_system_event("error", f"结果处理线程发生严重错误: {e}")
 
 def main():
     #
     # 主执行函数，负责初始化和启动所有服务。
     #
-    global api_client, subtitle_config_global, FRP_SERVER_ADDR, TASK_QUEUE, RESULT_QUEUE
-    
-    try:
+    global api_client, subtitle_config_global, FRP_SERVER_ADDR
+    global TASK_QUEUE, RESULT_QUEUE, UPLOAD_QUEUE # <--- 新增 UPLOAD_QUEUE
 
+    try:
         # --- 1. 启动前准备 ---
         log_system_event("info", "服务正在启动...")
-
-        # 【核心修改】第一步：卸载可能已存在的默认torch，并安装与Kaggle CUDA 12.1兼容的特定版本
+        
         install_torch_cmd = (
             "pip uninstall -y torch torchvision torchaudio && "
             "pip install torch==2.3.0 torchaudio==2.3.0 --index-url https://download.pytorch.org/whl/cu121"
         )
         log_system_event("info", "正在安装兼容的 PyTorch 版本...")
-        # 使用 subprocess.run 等待命令完成并检查错误
         install_proc = subprocess.run(install_torch_cmd, shell=True, capture_output=True, text=True)
         if install_proc.returncode != 0:
             log_system_event("error", f"PyTorch 安装失败！\nStdout: {install_proc.stdout}\nStderr: {install_proc.stderr}")
             raise RuntimeError("未能安装兼容的 PyTorch 版本。")
         log_system_event("info", "✅ 兼容的 PyTorch 安装完成。")
-
-        # 【核心修改】第二步：安装其余的库
+        
         install_other_cmd = "pip install -q pydantic pydub faster-whisper@https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.tar.gz denoiser google-generativeai requests psutil"
         log_system_event("info", "正在安装其余依赖库...")
         subprocess.run(install_other_cmd, shell=True, check=True)
         log_system_event("info", "✅ 其余依赖库安装完成。")
+        
         check_environment()
         
         # --- 设置多进程启动方法 ---
-        # Kaggle环境推荐使用 'fork'
         multiprocessing.set_start_method('fork', force=True)
 
         # --- 2. 解密配置 ---
         frp_config = get_decrypted_config(ENCRYPTED_FRP_CONFIG, "FRP")
         subtitle_config_global = get_decrypted_config(ENCRYPTED_SUBTITLE_CONFIG, "Subtitle")
-        
         FRP_SERVER_ADDR = frp_config['FRP_SERVER_ADDR']
         FRP_SERVER_PORT = frp_config['FRP_SERVER_PORT']
         FRP_TOKEN = frp_config['FRP_TOKEN']
@@ -1284,7 +1743,6 @@ def main():
         # --- 4. 启动 MixFileCLI 服务 ---
         log_system_event("info", "正在创建 MixFileCLI config.yml...")
         with open("config.yml", "w") as f: f.write(mixfile_config_yaml)
-        
         log_system_event("info", "正在下载并启动 MixFileCLI...")
         if not os.path.exists("mixfile-cli.jar"):
             run_command("wget -q --show-progress https://raw.githubusercontent.com/jornhand/kagglewithmixfile/refs/heads/main/mixfile-cli-2.0.1.jar -O mixfile-cli.jar").wait()
@@ -1295,14 +1753,24 @@ def main():
         # --- 5. 初始化多进程队列和工作进程 ---
         TASK_QUEUE = multiprocessing.Queue()
         RESULT_QUEUE = multiprocessing.Queue()
-        
-        worker = multiprocessing.Process(
+        UPLOAD_QUEUE = multiprocessing.Queue() # 新增上传队列
+
+        # 启动媒体处理工作进程
+        media_worker = multiprocessing.Process(
             target=worker_process_loop,
-            args=(TASK_QUEUE, RESULT_QUEUE),
-            daemon=True
+            args=(TASK_QUEUE, RESULT_QUEUE, UPLOAD_QUEUE), 
+            daemon=False
         )
-        worker.start()
+        media_worker.start()
         
+        # 启动专用的上传工作进程
+        uploader_worker = multiprocessing.Process(
+            target=uploader_process_loop,
+            args=(UPLOAD_QUEUE, RESULT_QUEUE),
+            daemon=False
+        )
+        uploader_worker.start()
+
         # 启动结果处理线程
         result_thread = threading.Thread(
             target=result_processor_thread_loop,
@@ -1311,8 +1779,7 @@ def main():
         )
         result_thread.start()
 
-
-        # --- 6. 启动 Flask API 服务 (必须在 if __name__ == '__main__': 块内启动) ---
+        # --- 6. 启动 Flask API 服务 ---
         def run_flask_app():
             app.run(host='0.0.0.0', port=FLASK_API_LOCAL_PORT, debug=False, use_reloader=False)
         log_system_event("info", "正在后台启动 Flask API 服务...")
@@ -1359,7 +1826,9 @@ remote_port = {FLASK_API_REMOTE_PORT}
         
         while True:
             time.sleep(300)
-            log_system_event("info", f"服务持续运行中... ({time.ctime()}) 工作进程状态: {'存活' if worker.is_alive() else '已退出'}")
+            all_workers_alive = media_worker.is_alive() and uploader_worker.is_alive()
+            worker_status_msg = '全部存活' if all_workers_alive else '存在已退出的工作进程'
+            log_system_event("info", f"服务持续运行中... ({time.ctime()}) 工作进程状态: {worker_status_msg}")
             
     except (DecryptionError, RuntimeError, ValueError) as e:
         log_system_event("critical", f"程序启动过程中发生致命错误: {e}")
@@ -1367,7 +1836,9 @@ remote_port = {FLASK_API_REMOTE_PORT}
     except KeyboardInterrupt:
         log_system_event("info", "服务已手动停止。")
         if 'TASK_QUEUE' in globals() and TASK_QUEUE is not None:
-            TASK_QUEUE.put(None) # 发送信号让子进程退出
+            TASK_QUEUE.put(None)
+        if 'UPLOAD_QUEUE' in globals() and UPLOAD_QUEUE is not None:
+            UPLOAD_QUEUE.put(None)
     except Exception as e:
         log_system_event("critical", f"发生未知的致命错误: {e}")
 
