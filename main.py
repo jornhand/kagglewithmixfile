@@ -586,6 +586,7 @@ class ProxyManager:
             test_filename = f"speed_test_{random_suffix}.tmp"
             return urljoin(api_client_base_url, f"/api/upload/{quote(test_filename)}")
         print("正在测试下载速度...")
+        
         download_speed = wifi.download() / 1_000_000  # 转换为Mbps
         print(f"下载速度: {download_speed:.2f} Mbps")
 
