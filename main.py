@@ -1601,8 +1601,8 @@ def uploader_process_loop(upload_queue: multiprocessing.Queue, result_queue: mul
                     if isinstance(response, requests.Response):
                         if response.ok:
                             share_code = response.text.strip()
-                            share_url = f"http://{frp_server_addr}:{MIXFILE_REMOTE_PORT}/api/download/{quote(filename_for_link)}?s={share_code}"
-                            _update_uploader_status("SUCCESS", details="上传成功", output={"shareUrl": share_url})
+                            output_data = {"shareCode": share_code}
+                            _update_uploader_status("SUCCESS", details="上传成功", output=output_data)                                                            
                             log_system_event("info", f"✅ [上传进程] [{component}] 上传成功。", in_worker=True)
                         else:
                             raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
@@ -1689,6 +1689,13 @@ def result_processor_thread_loop(result_queue: multiprocessing.Queue):
                     if 'results' in payload:
                         for component, data in payload['results'].items():
                             if component in task['results']:
+                                if 'output' in data and 'output' in task['results'][component] and isinstance(task['results'][component]['output'], dict):
+                                    # 如果新旧 output 都是字典，则合并它们
+                                    task['results'][component]['output'].update(data['output'])
+                                    # 从 data 中移除 output，避免被下面的 update 再次处理
+                                    del data['output']
+                                
+                                # 更新其他字段 (status, details, etc.)
                                 task['results'][component].update(data)
                     # 只要有更新，就认为是RUNNING（除非已经是最终状态）
                     if task['status'] not in ["SUCCESS", "FAILED", "PARTIAL_SUCCESS"]:
