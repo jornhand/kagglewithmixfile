@@ -90,7 +90,7 @@ except ImportError as e:
 # -- A. MixFileCLI 配置 --
 mixfile_config_yaml = """
 uploader: "线路A2"
-upload_task: 10
+upload_task: 20
 upload_retry: 10
 download_task: 5
 chunk_size: 1024
@@ -548,7 +548,7 @@ class ProxyManager:
         """
         try:
             # 使用较小的测试数据以加快测速过程
-            test_data_size = 3 * 1024 * 1024  # 1MB
+            test_data_size = 5 * 1024 * 1024  # 1MB
             test_data = os.urandom(test_data_size)
             
             start_time = time.time()
