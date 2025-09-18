@@ -138,7 +138,7 @@ class DecryptionError(Exception):
 
 def _get_decryption_cipher():
     #
-    # 辅助函数：从 Kaggle Secrets 获取密码并生成 Fernet 解密器。
+    # 辅助函数：从 Kaggle Secrets 获取密码并生成 Fernet 解密器。c
     # 这是一个共享逻辑，被其他解密函数调用。
     #
     if not UserSecretsClient or not Fernet:
